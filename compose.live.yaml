@@ -1,0 +1,54 @@
+name: youju-live
+
+# 全新真实接入：无飞书参数即可启动，访问网页后用安装码完成绑定。
+# 默认仅监听本机；公网部署应由反向代理提供 HTTPS，并使用 APP_ENV=production。
+services:
+  api:
+    image: youju-finance-backend:local
+    build:
+      context: ./backend
+    environment: &live-environment
+      APP_MODE: live
+      APP_ENV: ${APP_ENV:-development}
+      ALLOW_INSECURE_HTTP: ${ALLOW_INSECURE_HTTP:-false}
+      APP_PUBLIC_URL: ${APP_PUBLIC_URL:-http://127.0.0.1:18080}
+      SESSION_SECRET: ${SESSION_SECRET:-}
+      DATABASE_URL: sqlite:////data/db/app.db
+      STORAGE_ROOT: /data/files
+      CONFIG_ROOT: /data/config
+      AGENT_INTERNAL_URL: http://127.0.0.1:8000
+    volumes: &live-volumes
+      - database:/data/db
+      - originals:/data/files
+      - configuration:/data/config
+    restart: unless-stopped
+    stop_grace_period: 120s
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health/ready', timeout=4)"]
+      interval: 10s
+      timeout: 6s
+      retries: 20
+      start_period: 60s
+  events:
+    image: youju-finance-backend:local
+    command: ["python", "-m", "app.feishu_events"]
+    environment: *live-environment
+    volumes: *live-volumes
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+  web:
+    image: youju-finance-web
+    build: ./frontend
+    ports:
+      - "127.0.0.1:${APP_PORT:-18080}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  database:
+  originals:
+  configuration:

@@ -1,0 +1,55 @@
+name: youju-feishu-development
+
+# 独立真实联调环境：只监听本机，使用单独数据卷；不会加载或写入演示台账。
+services:
+  api:
+    image: youju-finance-backend:local
+    build:
+      context: ./backend
+    env_file: ./data/feishu-development/app.env
+    environment: &live-development
+      APP_MODE: live
+      APP_ENV: development
+      APP_PUBLIC_URL: http://127.0.0.1:18081
+      FEISHU_EVENT_TRANSPORT: websocket
+      DATABASE_URL: sqlite:////data/db/app.db
+      STORAGE_ROOT: /data/files
+      CONFIG_ROOT: /data/config
+      AGENT_INTERNAL_URL: http://127.0.0.1:8000
+    volumes: &development-volumes
+      - sqlite-development:/data/db
+      - originals-development:/data/files
+      - configuration-development:/data/config
+    restart: unless-stopped
+    stop_grace_period: 120s
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health/ready', timeout=4)"]
+      interval: 10s
+      timeout: 6s
+      retries: 12
+      start_period: 30s
+
+  events:
+    image: youju-finance-backend:local
+    command: ["python", "-m", "app.feishu_events"]
+    env_file: ./data/feishu-development/app.env
+    environment: *live-development
+    volumes: *development-volumes
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  web:
+    image: youju-finance-web
+    ports:
+      - "127.0.0.1:18081:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  sqlite-development:
+  originals-development:
+  configuration-development:

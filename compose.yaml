@@ -1,0 +1,72 @@
+name: youju-finance
+
+services:
+  api:
+    image: youju-finance-backend:local
+    build:
+      context: ./backend
+    environment: &application-environment
+      APP_MODE: ${APP_MODE:-demo}
+      APP_ENV: ${APP_ENV:-production}
+      ALLOW_INSECURE_HTTP: ${ALLOW_INSECURE_HTTP:-false}
+      APP_PUBLIC_URL: ${APP_PUBLIC_URL:-http://localhost:18080}
+      SESSION_SECRET: ${SESSION_SECRET:-demo-only-change-this-before-live-deployment}
+      STORAGE_ROOT: /data/files
+      CONFIG_ROOT: /data/config
+      SYNC_ENABLED: ${SYNC_ENABLED:-true}
+      SYNC_INTERVAL_SECONDS: ${SYNC_INTERVAL_SECONDS:-300}
+      FEISHU_APP_ID: ${FEISHU_APP_ID:-}
+      FEISHU_EVENT_TRANSPORT: ${FEISHU_EVENT_TRANSPORT:-http}
+      FEISHU_APP_SECRET: ${FEISHU_APP_SECRET:-}
+      FEISHU_ENCRYPT_KEY: ${FEISHU_ENCRYPT_KEY:-}
+      FEISHU_VERIFICATION_TOKEN: ${FEISHU_VERIFICATION_TOKEN:-}
+      FEISHU_TENANT_KEY: ${FEISHU_TENANT_KEY:-}
+      FEISHU_ADMIN_OPEN_IDS: ${FEISHU_ADMIN_OPEN_IDS:-}
+      FEISHU_FILE_HOST_SUFFIXES: ${FEISHU_FILE_HOST_SUFFIXES:-feishu.cn,feishucdn.com,feishucdn.cn,byteimg.com,volces.com,larksuite.com,feishu-3rd-party-domain.com}
+      MODEL_BASE_URL: ${MODEL_BASE_URL:-}
+      MODEL_NAME: ${MODEL_NAME:-}
+      MODEL_API_KEY: ${MODEL_API_KEY:-}
+      DATABASE_URL: sqlite:////data/db/app.db
+      AGENT_INTERNAL_URL: http://127.0.0.1:8000
+      AGENT_MAX_CONCURRENCY: ${AGENT_MAX_CONCURRENCY:-2}
+      AGENT_TURN_SECONDS: ${AGENT_TURN_SECONDS:-180}
+    volumes: &application-volumes
+      - sqlite-data:/data/db
+      - originals:/data/files
+      - configuration:/data/config
+    stop_grace_period: 120s
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health/ready', timeout=4)"]
+      interval: 10s
+      timeout: 6s
+      retries: 30
+      start_period: 90s
+
+  events:
+    profiles: ["live"]
+    image: youju-finance-backend:local
+    command: ["python", "-m", "app.feishu_events"]
+    environment: *application-environment
+    volumes: *application-volumes
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  web:
+    build: ./frontend
+    ports:
+      - "${APP_PORT:-18080}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  sqlite-data:
+    name: youju_sqlite_${APP_MODE:-demo}
+  originals:
+    name: youju_originals_${APP_MODE:-demo}
+  configuration:
+    name: youju_configuration_${APP_MODE:-demo}

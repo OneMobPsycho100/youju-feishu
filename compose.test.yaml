@@ -1,0 +1,57 @@
+# 测试服务器部署：分别使用 .env.live/.env.demo 和独立 Compose 项目，两个环境的数据卷互不混用。
+# 默认仅监听服务器回环地址；测试公网入口通过对应环境的 APP_BIND_ADDRESS 显式开放。
+services:
+  api:
+    image: ${BACKEND_IMAGE:?请指定本次发布的后端镜像}
+    env_file: ${RUNTIME_ENV_FILE:?请指定对应环境的配置文件}
+    environment: &application-environment
+      DATABASE_URL: sqlite:////data/db/app.db
+      STORAGE_ROOT: /data/files
+      CONFIG_ROOT: /data/config
+      AGENT_INTERNAL_URL: http://127.0.0.1:8000
+    volumes: &application-volumes
+      - database:/data/db
+      - originals:/data/files
+      - configuration:/data/config
+    restart: unless-stopped
+    stop_grace_period: 120s
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health/ready', timeout=4)"]
+      interval: 10s
+      timeout: 6s
+      retries: 20
+      start_period: 60s
+
+  events:
+    profiles: ["live"]
+    image: ${BACKEND_IMAGE:?请指定本次发布的后端镜像}
+    command: ["python", "-m", "app.feishu_events"]
+    env_file: ${RUNTIME_ENV_FILE:?请指定对应环境的配置文件}
+    environment: *application-environment
+    volumes: *application-volumes
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+  web:
+    image: ${WEB_IMAGE:?请指定本次发布的前端镜像}
+    ports:
+      - "${APP_BIND_ADDRESS:-127.0.0.1}:${APP_PORT:?请指定环境端口}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+# 使用已经核对过名称的数据卷，启动命令不会意外创建一个空业务库。
+volumes:
+  database:
+    external: true
+    name: ${DATABASE_VOLUME:?请指定数据库卷}
+  originals:
+    external: true
+    name: ${ORIGINALS_VOLUME:?请指定原件卷}
+  configuration:
+    external: true
+    name: ${CONFIGURATION_VOLUME:?请指定实例密钥卷}

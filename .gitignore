@@ -1,0 +1,37 @@
+# 环境配置与凭据：只提交供新安装使用的示例配置。
+.env
+.env.*
+*.env
+*.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# 本地依赖、缓存与构建产物。
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+node_modules/
+dist/
+target/
+*.tsbuildinfo
+*.log
+.DS_Store
+Thumbs.db
+
+# 业务数据库、原件、会话、验证资料与部署备份留在本机。
+data/
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+.openai/
+.playwright-mcp/
+deploy/
+docs/
+/scripts
