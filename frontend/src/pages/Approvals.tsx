@@ -33,6 +33,7 @@ import {
   SearchOutlined,
 } from "@ant-design/icons";
 import { bytes, localTime, money, post, query, useResource } from "../api";
+import { BudgetContextCard } from "../components/BudgetContextCard";
 import { useAgentPageContext, useWorkbench } from "../context";
 import { AICallLogs } from "../components/AICallLogs";
 import { FeishuApprovalForm } from "../components/FeishuApprovalForm";
@@ -62,6 +63,27 @@ import {
   StatusTag,
 } from "../ui";
 
+const collectionLabels: Record<Approval["payment_collection_status"], string> = {
+  NOT_STARTED: "材料未采集", QUEUED: "材料采集排队中", RUNNING: "材料采集中", COMPLETED: "材料采集完成", FAILED: "材料采集失败",
+};
+const paymentActionLabels: Record<Approval["payment_auto_approval_status"], string> = {
+  NOT_STARTED: "等待节点核对", REQUESTED: "自动同意已入队", EXECUTING: "自动同意回写中", UNKNOWN: "同意结果核对中",
+  SUCCEEDED: "专用节点已自动同意", FAILED: "自动同意已停止",
+};
+
+/** 采集、回写分别轮询，避免材料完成后过早停止刷新未知回写结果。 */
+function paymentWorkActive(row: Approval) {
+  return row.payment_auto_approve_enabled && (isAIApprovalActive(row.payment_collection_status)
+    || ["REQUESTED", "EXECUTING", "UNKNOWN"].includes(row.payment_auto_approval_status));
+}
+
+function PaymentCollectionTag({ row }: { row: Approval }) {
+  return <Tag color={row.payment_collection_status === "FAILED" || row.payment_collection_issues.length ? "warning"
+    : row.payment_collection_status === "COMPLETED" ? "success" : "processing"}>
+    {collectionLabels[row.payment_collection_status]}{row.payment_collection_issues.length ? ` · ${row.payment_collection_issues.length} 项提示` : ""}
+  </Tag>;
+}
+
 export function Approvals({ detailId }: { detailId?: string }) {
   const { tick, companyId, navigate, user, mode, onJob } = useWorkbench();
   const { message } = AntApp.useApp();
@@ -88,7 +110,7 @@ export function Approvals({ detailId }: { detailId?: string }) {
     }),
     tick,
   );
-  useApprovalPolling(!!resource.data?.items.some(row => row.ai_approval_enabled && isAIApprovalActive(row.ai_status)), resource.reload);
+  useApprovalPolling(!!resource.data?.items.some(row => paymentWorkActive(row) || row.ai_approval_enabled && isAIApprovalActive(row.ai_status)), resource.reload);
   const sync = async () => {
     setSyncing(true);
     try {
@@ -121,6 +143,7 @@ export function Approvals({ detailId }: { detailId?: string }) {
             options={[
               { label: "审批中", value: "PENDING" },
               { label: "全部审批", value: "" },
+              { label: "付款仅采集", value: "COLLECT" },
               { label: "需复核", value: "REVIEW" },
               { label: "预审通过", value: "PASS" },
               { label: "规则阻断", value: "BLOCK" },
@@ -233,16 +256,19 @@ export function Approvals({ detailId }: { detailId?: string }) {
                 ),
               },
               {
-                title: "预审结果",
+                title: "处理结果",
                 dataIndex: "decision",
-                width: 145,
-                render: (value: Decision, row) => <DecisionTag value={value} previous={row.ai_approval_enabled && !row.manual_review_valid && row.ai_status !== "COMPLETED"} />,
+                width: 210,
+                render: (value: Decision, row) => row.payment_auto_approve_enabled
+                  ? <Space direction="vertical" size={2}><Tag color="cyan">仅采集</Tag><small>{paymentActionLabels[row.payment_auto_approval_status]}</small></Space>
+                  : <DecisionTag value={value} previous={row.ai_approval_enabled && !row.manual_review_valid && row.ai_status !== "COMPLETED"} />,
               },
               {
-                title: "AI审批状态",
+                title: "材料 / AI进度",
                 dataIndex: "ai_status",
-                width: 140,
-                render: (value: Approval["ai_status"], row) => <AIApprovalStatusTag value={value} enabled={row.ai_approval_enabled} />,
+                width: 190,
+                render: (value: Approval["ai_status"], row) => row.payment_auto_approve_enabled ? <PaymentCollectionTag row={row} />
+                  : <AIApprovalStatusTag value={value} enabled={row.ai_approval_enabled} />,
               },
               {
                 title: "审批状态",
@@ -307,7 +333,6 @@ function InvoicePreview({ attachment, reference = false }: { attachment: Attachm
   if (isXlsxFile(attachment.filename, attachment.mime)) return <XlsxPreview key={attachment.id}
     url={`/api/v1/attachments/${attachment.id}/download`} filename={attachment.filename} size={attachment.size} />;
   const fields = attachment.parsed_data.fields || {};
-  if (!reference && attachment.parsed_data.parse_status === "SKIPPED") return <Empty description="普通附件保留原件，可下载查看" />;
   if (attachment.mime === "application/pdf")
     return (
       <iframe
@@ -325,6 +350,7 @@ function InvoicePreview({ attachment, reference = false }: { attachment: Attachm
       />
     );
   if (reference) return <Empty description="包内原件仅供查阅，可下载查看" />;
+  if (attachment.parsed_data.parse_status === "SKIPPED") return <Empty description="普通附件保留原件，可下载查看" />;
   if (attachment.parsed_data.material_type && attachment.parsed_data.material_type !== "INVOICE") return <MaterialText attachment={attachment} />;
   return (
     <div className="invoice-preview">
@@ -421,7 +447,7 @@ export function ApprovalDrawer({
   const { message } = AntApp.useApp();
   const resource = useResource<ApprovalDetail>(`/api/v1/approvals/${id}`, tick);
   const row = resource.data;
-  useApprovalPolling(!!row?.ai_approval_enabled && isAIApprovalActive(row.ai_status), resource.reload);
+  useApprovalPolling(!!row && (paymentWorkActive(row) || row.ai_approval_enabled && isAIApprovalActive(row.ai_status)), resource.reload);
   const [busy, setBusy] = useState(false);
   const [selectedAttachment, setSelectedAttachment] = useState("");
   const attachmentPreview = useRef<HTMLDivElement>(null);
@@ -455,6 +481,19 @@ export function ApprovalDrawer({
   const referenceMember = memberPackage?.mode === "REFERENCE";
   const readOnlyPackage = Boolean(selectedPackage || referenceMember || memberPackage?.status === "FAILED");
   const referenceSummary = row?.reference_pdf_summary;
+  // 保留历史版本；当前附件按实际内容与未解决状态分组，不按扩展名推定为发票。
+  const attachmentGroups = ["发票", "普通附件", "待确认", "历史附件"].map((label) => ({
+    label,
+    files: (row?.attachments || []).filter((file) => {
+      const data = file.parsed_data;
+      const group = !file.active ? "历史附件"
+        : data.archive || data.parse_status === "SKIPPED" ? "普通附件"
+        : data.material_type === "UNKNOWN" || data.classification && !data.classification.complete || data.error || data.recognition?.status === "UNCERTAIN" ? "待确认"
+        : data.material_type && data.material_type !== "INVOICE" ? "普通附件"
+        : file.invoice_id || data.confirmed || data.fields?.number ? "发票" : "待确认";
+      return label === group;
+    }),
+  }));
   const fileRecognitionLabel = (file: Attachment) => {
     if (memberSources.get(file.id)?.parent.parsed_data.archive?.mode === "REFERENCE" && !file.parsed_data.reference_pdf)
       return file.mime === "application/pdf" ? "PDF 待识别" : "仅供查阅";
@@ -477,6 +516,7 @@ export function ApprovalDrawer({
     row?.status === "PENDING" &&
     row.task_status === "PENDING" &&
     Boolean(row.task_id) &&
+    !row.payment_auto_approve_enabled &&
     !outstanding;
   let taskUnavailable = "";
   if (mode !== "demo" && row?.status === "PENDING" && !outstanding) {
@@ -494,7 +534,7 @@ export function ApprovalDrawer({
   const rejectionEvidence = pendingEvidence.filter((item) => item.auto_reject_eligible);
   const wasReviewed = (item: Evidence) => item.reviewed || (!item.source && item.code === "SEMANTIC"
     && row?.audit?.model_analysis.manual_review?.reviewed_codes.includes("SEMANTIC"));
-  const automaticRejection = row?.actions.find((item) => item.action === "REJECT" && item.source_audit_id
+  const automaticRejection = !row?.payment_auto_approve_enabled && row?.actions.find((item) => item.action === "REJECT" && item.source_audit_id
     && (item.source_audit_id === row.audit?.id || row.status === "REJECTED"));
   const startReview = () => {
     if (!row) return;
@@ -729,11 +769,12 @@ export function ApprovalDrawer({
             </div>
             <div className="detail-tags">
               <Tag color={row.business_type === "PAYMENT" ? "purple" : "blue"}>{row.business_type === "PAYMENT" ? "付款申请" : "费用报销"}</Tag>
-              <DecisionTag value={row.decision} previous={row.ai_approval_enabled && !row.manual_review_valid && row.ai_status !== "COMPLETED"} />
-              <Space size={4}>
+              {row.payment_auto_approve_enabled ? <Tag color="cyan">仅采集 · 自动同意</Tag>
+                : <DecisionTag value={row.decision} previous={row.ai_approval_enabled && !row.manual_review_valid && row.ai_status !== "COMPLETED"} />}
+              {row.payment_auto_approve_enabled ? <PaymentCollectionTag row={row} /> : <Space size={4}>
                 {row.ai_approval_enabled && <span className="muted">AI审批</span>}
                 <AIApprovalStatusTag value={row.ai_status} enabled={row.ai_approval_enabled} />
-              </Space>
+              </Space>}
               <StatusTag value={row.status} />
               <ApprovalCompanies approval={row} />
               <Tag>未验真</Tag>
@@ -782,6 +823,14 @@ export function ApprovalDrawer({
               ]} />
               {row.payment_details.material_issues.map(issue => <Alert key={issue.key} type="warning" showIcon message={`${issue.filename}：${issue.reason}`} />)}
             </>}
+            {row.payment_auto_approve_enabled && <Alert className="detail-alert" type="info" showIcon
+              message={paymentActionLabels[row.payment_auto_approval_status]}
+              description="本单仅收集付款数据和材料，不执行付款规则审核。材料与票面异常仅作记录；自动同意只作用于专用节点，后续审批继续在飞书流转。" />}
+            {row.payment_auto_approve_enabled && row.payment_collection_issues.map((issue, index) => <Alert
+              key={`${issue.code}-${index}`} className="detail-alert" type="warning" showIcon
+              message={`${issue.filename}：${issue.detail}`} />)}
+            {row.payment_auto_approve_enabled && row.payment_collection_status === "FAILED" && row.payment_collection_task_id && canWrite && <Button
+              loading={busy} onClick={() => void run(`/api/v1/jobs/${row.payment_collection_task_id}/retry`, "重试付款材料采集")}>重试材料采集</Button>}
             {outstanding && (
               <Alert
                 className="detail-alert"
@@ -809,6 +858,7 @@ export function ApprovalDrawer({
                   SUCCEEDED: "已按标准拒绝", FAILED: "自动拒绝失败" }[automaticRejection.status] || "自动拒绝处理记录"}
                 description={<><span className="rejection-message">{automaticRejection.comment}</span>{automaticRejection.error && <p>{automaticRejection.error}</p>}</>} />
             )}
+            <BudgetContextCard context={row.budget_context} />
             <Tabs
               ref={detailTabs}
               activeKey={tab}
@@ -821,16 +871,18 @@ export function ApprovalDrawer({
                 },
                 {
                   key: "audit",
-                  label: row.ai_approval_enabled ? "Agent 预审" : "人工预审",
+                  label: row.payment_auto_approve_enabled ? "采集与历史记录" : row.ai_approval_enabled ? "Agent 预审" : "人工预审",
                   children: (
                     <>
                       <div
                         className={`audit-summary summary-${row.decision.toLowerCase()}`}
                       >
                         <div>
-                          <DecisionTag value={row.decision} previous={row.ai_approval_enabled && !row.manual_review_valid && row.ai_status !== "COMPLETED"} />
+                          {row.payment_auto_approve_enabled ? <Tag color="cyan">仅采集</Tag>
+                            : <DecisionTag value={row.decision} previous={row.ai_approval_enabled && !row.manual_review_valid && row.ai_status !== "COMPLETED"} />}
                           <strong>
-                            {referenceSummary ? "原预审记录，当前票面见下方补充识别" : row.manual_review_valid
+                            {row.payment_auto_approve_enabled ? `${collectionLabels[row.payment_collection_status]}，不生成付款审核结论`
+                              : referenceSummary ? "原预审记录，当前票面见下方补充识别" : row.manual_review_valid
                               ? row.status === "PENDING" ? "整单人工复核已通过，可直接同意预审" : "整单人工复核已通过"
                               : !row.ai_approval_enabled
                               ? row.status === "PENDING" ? "请核对原件并完成整单人工复核" : "模板当前由财务人工预审"
@@ -851,7 +903,7 @@ export function ApprovalDrawer({
                         </div>
                         <span>
                           {row.audit
-                            ? `${row.ai_approval_enabled ? `规则 V${row.audit.rule_version}` : "复核记录"} · ${localTime(row.audit.created_at)}`
+                            ? `${row.payment_auto_approve_enabled ? "历史审核记录" : row.ai_approval_enabled ? `规则 V${row.audit.rule_version}` : "复核记录"} · ${localTime(row.audit.created_at)}`
                             : row.ai_approval_enabled ? "等待预审处理" : ""}
                         </span>
                       </div>
@@ -972,7 +1024,7 @@ export function ApprovalDrawer({
                         </div>
                       )}
                       <div className="detail-inline-actions">
-                        {canWrite && (row.ai_approval_enabled || referenceSummary) && (
+                        {canWrite && !row.payment_auto_approve_enabled && (row.ai_approval_enabled || referenceSummary) && (
                           <Button
                             icon={<ReloadOutlined />}
                             loading={busy}
@@ -1016,7 +1068,9 @@ export function ApprovalDrawer({
                       )}
                       {referenceSummary && <ReferencePdfInvoiceTable attachments={row.attachments} onView={viewAttachment} />}
                       <div className="attachment-list">
-                        {row.attachments.map((file) => (
+                        {attachmentGroups.filter((group) => group.files.length > 0).map((group) => <section className="attachment-group" key={group.label}>
+                          <h4>{group.label} ({group.files.length})</h4>
+                          {group.files.map((file) => (
                           <button
                             key={file.id}
                             onClick={() => setSelectedAttachment(file.id)}
@@ -1032,7 +1086,8 @@ export function ApprovalDrawer({
                               </small>
                             </div>
                           </button>
-                        ))}
+                          ))}
+                        </section>)}
                       </div>
                       <div className="attachment-preview-wrap" ref={attachmentPreview}>
                         {attachment ? (
@@ -1041,7 +1096,7 @@ export function ApprovalDrawer({
                               <Tag
                                 color={
                                   attachment.parsed_data.parse_status === "SKIPPED" ? "default" : attachment.parsed_data.confirmed ||
-                                  ["LOCAL", "VERIFIED", "STRUCTURED"].includes(attachment.parsed_data.recognition?.status || "")
+                                  ["LOCAL", "VERIFIED", "STRUCTURED", "OCR"].includes(attachment.parsed_data.recognition?.status || "")
                                     ? "success"
                                     : "warning"
                                 }
@@ -1061,8 +1116,8 @@ export function ApprovalDrawer({
                                 核对并确认票面
                                     </Button>
                                   )}
-                                 {canAct && row.business_type === "PAYMENT" && attachment.active && !readOnlyPackage && <Button size="small" onClick={() => {
-                                  materialForm.setFieldsValue({ material_type: attachment.parsed_data.material_type === "UNKNOWN" ? undefined : attachment.parsed_data.material_type, comment: "" });
+                                 {canAct && (row.business_type === "PAYMENT" || attachment.mime === "application/pdf" || attachment.mime.startsWith("image/")) && attachment.active && !readOnlyPackage && <Button size="small" onClick={() => {
+                                  materialForm.setFieldsValue({ material_type: attachment.parsed_data.material_type === "UNKNOWN" ? undefined : row.business_type !== "PAYMENT" && attachment.parsed_data.material_type && attachment.parsed_data.material_type !== "INVOICE" ? "OTHER" : attachment.parsed_data.material_type, comment: "" });
                                   setMaterialConfirmation({ file: attachment, version: row.version });
                                 }}>确认材料类别</Button>}
                                 <Button
@@ -1158,7 +1213,7 @@ export function ApprovalDrawer({
                               <div>
                                 <strong>
                                   {item.actor_name} ·{" "}
-                                  {item.action === "APPROVE"
+                                  {item.execution_source === "PAYMENT_AUTO_APPROVE" ? "付款仅采集自动同意" : item.action === "APPROVE"
                                     ? "同意预审"
                                     : "拒绝预审"}
                                 </strong>
@@ -1187,10 +1242,10 @@ export function ApprovalDrawer({
           </>
         )}
       </ResourceState>
-      <Modal open={!!materialConfirmation} title="确认付款材料类别" onCancel={() => !busy && setMaterialConfirmation(null)} onOk={() => void submitMaterial()} confirmLoading={busy} okText={row?.ai_approval_enabled ? "确认并重新审核" : "保存确认"}>
+      <Modal open={!!materialConfirmation} title="确认附件材料类别" onCancel={() => !busy && setMaterialConfirmation(null)} onOk={() => void submitMaterial()} confirmLoading={busy} okText={row?.ai_approval_enabled ? "确认并重新审核" : "保存确认"}>
         <p>请先核对原件。材料类别确认不会直接同意审批，已入台账的发票仍保留占用约束。</p>
         <Form form={materialForm} layout="vertical">
-          <Form.Item name="material_type" label="材料类别" rules={[{ required: true }]}><Select options={[{ value: "INVOICE", label: "发票" }, { value: "CONTRACT", label: "合同" }, { value: "QUOTE", label: "报价单" }, { value: "OTHER", label: "其他材料" }]} /></Form.Item>
+          <Form.Item name="material_type" label="材料类别" rules={[{ required: true }]}><Select options={row?.business_type === "PAYMENT" ? [{ value: "INVOICE", label: "发票" }, { value: "CONTRACT", label: "合同" }, { value: "QUOTE", label: "报价单" }, { value: "OTHER", label: "其他材料" }] : [{ value: "INVOICE", label: "发票" }, { value: "OTHER", label: "普通附件" }]} /></Form.Item>
           <Form.Item name="comment" label="核对依据" rules={[{ required: true, whitespace: true, min: 2 }]}><Input.TextArea maxLength={600} rows={3} /></Form.Item>
         </Form>
       </Modal>

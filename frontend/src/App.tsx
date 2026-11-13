@@ -12,11 +12,13 @@ import {
   ApartmentOutlined,
   AuditOutlined,
   BarChartOutlined,
+  WalletOutlined,
   BellOutlined,
   CloudSyncOutlined,
   DashboardOutlined,
   FileProtectOutlined,
   FolderOpenOutlined,
+  FundOutlined,
   LogoutOutlined,
   SettingOutlined,
   ThunderboltFilled,
@@ -44,10 +46,14 @@ const Settings = lazy(() =>
   import("./pages/Settings").then((module) => ({ default: module.Settings })),
 );
 const Statistics = lazy(() => import("./pages/Statistics").then((module) => ({ default: module.Statistics })));
+const PaymentStatistics = lazy(() => import("./pages/PaymentStatistics").then((module) => ({ default: module.PaymentStatistics })));
+const Budgets = lazy(() => import("./pages/Budgets").then((module) => ({ default: module.Budgets })));
 
 const navItems = [
   { key: "overview", label: "财务总览", icon: <DashboardOutlined /> },
   { key: "statistics", label: "报销统计", icon: <BarChartOutlined /> },
+  { key: "payment-statistics", label: "付款统计", icon: <FundOutlined /> },
+  { key: "budgets", label: "预算管理", icon: <WalletOutlined /> },
   { key: "approvals", label: "审批中心", icon: <AuditOutlined /> },
   { key: "invoices", label: "发票台账", icon: <FileProtectOutlined /> },
   { key: "archives", label: "归档中心", icon: <FolderOpenOutlined /> },
@@ -304,8 +310,20 @@ export default function App() {
               <b>{selected.label}</b>
             </div>
             <div className="topbar-right">
-              <Button type="text" icon={<RobotOutlined />} onClick={openAgent} className="agent-topbar-entry">
-                {agentBusy ? "业务助手处理中" : "业务助手"}
+              <Select
+                value={companyId}
+                onChange={setCompanyId}
+                className="global-company-select"
+                aria-label="筛选公司主体"
+                suffixIcon={<ApartmentOutlined />}
+                options={[
+                  { value: "", label: "全部公司主体" },
+                  ...companies.map((x) => ({ value: x.id, label: x.name })),
+                ]}
+              />
+              <Button type="text" icon={<RobotOutlined />} onClick={openAgent} className="agent-topbar-entry"
+                aria-label={agentBusy ? "业务助手处理中" : "打开业务助手"}>
+                <span className="agent-topbar-label">{agentBusy ? "业务助手处理中" : "业务助手"}</span>
               </Button>
               {mode === "demo" && <Tag className="demo-tag">演示环境</Tag>}
               <span className="topbar-date">
@@ -364,16 +382,6 @@ export default function App() {
               <h1>{selected.label}</h1>
               <div className="page-heading-actions">
                 {page === "overview" && <Button type="primary" onClick={() => navigate("approvals")}>处理审批</Button>}
-                <Select
-                  value={companyId}
-                  onChange={setCompanyId}
-                  className="global-company-select"
-                  suffixIcon={<ApartmentOutlined />}
-                  options={[
-                    { value: "", label: "全部公司主体" },
-                    ...companies.map((x) => ({ value: x.id, label: x.name })),
-                  ]}
-                />
                 <Button icon={<CloudSyncOutlined />} onClick={refresh}>
                   刷新数据
                 </Button>
@@ -390,8 +398,12 @@ export default function App() {
                 </div>
               }
             >
-              {page === "statistics" ? (
+              {page === "budgets" ? (
+                <Budgets budgetId={route.split("/")[1]} />
+              ) : page === "statistics" ? (
                 <Statistics />
+              ) : page === "payment-statistics" ? (
+                <PaymentStatistics />
               ) : page === "approvals" ? (
                 <Approvals detailId={route.split("/")[1]} />
               ) : page === "invoices" ? (

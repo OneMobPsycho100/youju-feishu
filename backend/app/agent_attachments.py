@@ -163,15 +163,13 @@ def parse_attachment(path: Path, config, ocr_config: OCRConfigSnapshot, conversa
             segments = [{"location": f"第{index}行", "text": line} for index, line in enumerate(text.splitlines(), 1) if line.strip()]
         return _bounded(segments), {}, ""
     if suffix == ".pdf":
-        segments = read_pdf_segments(path, max_text=MAX_TEXT)
-        text = "\n".join(item["text"] for item in segments)
-        # 通用 PDF 可能仅在条款中提到开票；同时读出票种和编号才按发票提取本地字段。
-        compact_text = re.sub(r"\s+", "", text)
-        suspected = bool(re.search(r"电子发票|数电(?:发票|票)|增值税(?:电子)?(?:专用|普通)发票|Invoice", compact_text, re.I)
-            and re.search(r"(?:发票号码|发票代码|Invoice(?:Number|No|Code))[:：]?(?:\d{20}|\d{12}|\d{10}|\d{8})(?!\d)", compact_text, re.I))
-        if not suspected:
-            return _bounded(segments), {}, ""
-        local = parse(path)
+        from .pdf_text import PdfTextMissing
+        try:
+            segments = read_pdf_segments(path, max_text=MAX_TEXT)
+        except PdfTextMissing:
+            # 扫描 PDF 仍进入整份图像分类，正文缺失单独提示，不提前误报文件解析失败。
+            warning = "扫描 PDF 无本地文字层，请结合原件核对正文"
+        suspected = True
     elif suffix in {".xml", ".ofd"}:
         local = parse(path)
         text = local.get("raw_text", "")
@@ -180,12 +178,15 @@ def parse_attachment(path: Path, config, ocr_config: OCRConfigSnapshot, conversa
         segments, suspected = [{"location": "结构化原件", "text": text}], True
     else:
         segments, suspected = _image_reading(path, config, conversation_id)
+        suspected = True
     if suspected:
         invoice_result = parse_with_fallback(path, config, ocr_config=ocr_config, approval_id=None, template_code="", parent_db=None,
             sha256=sha256, previous=previous, local_result=local, agent_conversation_id=conversation_id)
         if invoice_result.get("rejected"):
             warning = invoice_result.get("error") or "原件含多张发票或身份存在冲突，无法判定使用状态"
-        elif not (invoice_result.get("recognition", {}).get("fields") or {}).get("number"):
+        elif invoice_result.get("material_type") == "UNKNOWN":
+            warning = invoice_result.get("error") or "附件类别尚未确认"
+        elif invoice_result.get("material_type") == "INVOICE" and not ((invoice_result.get("recognition") or {}).get("fields") or {}).get("number"):
             warning = "发票号码尚未取得可信一致结果，使用状态无法判定；可上传清晰原件重试"
     return _bounded(segments), invoice_result, warning
 
@@ -300,7 +301,7 @@ def read_attachment(db, data, handle, user):
             pieces.append({"location": segment["location"], "text": text[max(0, data.offset-start):max(0, end-start)]})
     return {"entity": "attachment", "attachment": attachment_dump(row), "segments": pieces,
             "total_characters": total, "next_offset": end if end < total else None,
-            "invoice_candidate": bool(row.recognition), "warning": row.error}
+            "invoice_candidate": (row.recognition or {}).get("material_type", "INVOICE") == "INVOICE" and bool(row.recognition), "warning": row.error}
 
 
 def check_invoice_usage(db, data, handle, user):

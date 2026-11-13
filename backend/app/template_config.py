@@ -4,6 +4,7 @@ from sqlalchemy import select
 from . import schemas as s
 from .audit_policy import configurable, default_rule_entries, explicit_rules
 from .db import begin_write
+from .ai_status import payment_collection_enabled
 from .integrations import DomainError
 from .models import Approval, ApprovalTemplate
 from .services import invalidate_pending, log, settle_disabled_ai_work
@@ -15,6 +16,8 @@ def set_template_ai_approval(db, code: str, enabled: bool, actor: str) -> Approv
     row = db.get(ApprovalTemplate, code)
     if not row or row.ai_approval_enabled == enabled:
         return row
+    if payment_collection_enabled(row):
+        raise DomainError("付款仅采集模式已开启，请先关闭仅采集开关再调整 AI 审批")
     row.ai_approval_enabled, row.mode = enabled, "OBSERVE"
     db.flush()
     if not enabled:
@@ -22,6 +25,25 @@ def set_template_ai_approval(db, code: str, enabled: bool, actor: str) -> Approv
     invalidate_pending(db, code, ai_approval_changed=True)
     log(db, actor, "开启 AI 审批" if enabled else "关闭 AI 审批", row.name,
         {"template_code": code, "ai_approval_enabled": enabled})
+    return row
+
+
+def set_template_payment_auto_approval(db, code: str, enabled: bool, actor: str) -> ApprovalTemplate | None:
+    """只修改付款策略，不覆盖 AI、规则或模式；同状态重复保存不重复安排刷新。"""
+    begin_write(db)
+    row = db.get(ApprovalTemplate, code)
+    if not row:
+        return None
+    if row.business_type != "PAYMENT":
+        raise DomainError("仅付款模板支持仅采集自动同意")
+    if row.payment_auto_approve_enabled == enabled:
+        return row
+    row.payment_auto_approve_enabled = enabled
+    db.flush()
+    from .payment_collection import reset_payment_work
+    reset_payment_work(db, row)
+    log(db, actor, "开启付款仅采集自动同意" if enabled else "关闭付款仅采集自动同意", row.name,
+        {"template_code": code, "payment_auto_approve_enabled": enabled})
     return row
 
 
@@ -33,10 +55,19 @@ def apply_template_config(db, data: s.TemplateInput, actor: str, *, importing: b
     """
     begin_write(db)
     row = db.get(ApprovalTemplate, data.code)
+    business_type = data.business_type if not row or "business_type" in data.model_fields_set else row.business_type
+    payment_enabled = (data.payment_auto_approve_enabled if "payment_auto_approve_enabled" in data.model_fields_set
+        else row.payment_auto_approve_enabled if row else business_type == "PAYMENT")
+    if importing:
+        payment_enabled = business_type == "PAYMENT"
+    if business_type != "PAYMENT" and payment_enabled:
+        raise DomainError("仅付款模板支持仅采集自动同意")
+    was_collecting = payment_collection_enabled(row)
+    collecting = business_type == "PAYMENT" and payment_enabled
     required = {"definition_read", "details_read", "files_downloaded", "node_matched", "task_write"}
-    if not importing and data.mode == "AUTO" and (not row or not row.ai_approval_enabled):
+    if not importing and not collecting and data.mode == "AUTO" and (not row or not row.ai_approval_enabled):
         raise DomainError("请先开启此模板的 AI 审批，再开启自动处理")
-    if not importing and data.mode == "AUTO" and (
+    if not importing and not collecting and data.mode == "AUTO" and (
         not row or not row.subscribed or not all(row.capabilities.get(key) for key in required)
     ):
         raise DomainError("请先完成模板读取、附件下载、节点身份核对和一次人工回写，再开启自动模式")
@@ -60,6 +91,9 @@ def apply_template_config(db, data: s.TemplateInput, actor: str, *, importing: b
     task_scope_changed = node_scope_changed or row.reviewer_open_id != data.reviewer_open_id
     values = data.model_dump(mode="json", exclude={"code", "node_id", "node_ids"})
     values.update(node_ids=node_ids, node_id=node_ids[0])
+    values["payment_auto_approve_enabled"] = payment_enabled
+    if collecting and not is_new and data.mode != row.mode and not importing:
+        raise DomainError("付款仅采集模式下保留原自动处理配置，请关闭仅采集开关后再调整")
     policy_fields = {"policy_schema_version", "builtin_rules", "custom_rules", "entries"}
     if not importing:
         # 普通编辑兼容旧客户端；导入已明确携带完整结构，不能隐式升级规则版本。
@@ -102,8 +136,12 @@ def apply_template_config(db, data: s.TemplateInput, actor: str, *, importing: b
     if changed:
         if importing:
             settle_disabled_ai_work(db, data.code)
-        invalidate_pending(db, data.code, reset_pre_review_task=task_scope_changed,
-                           refresh_source=mapping_changed or activated, ai_approval_changed=importing)
+        if business_type == "PAYMENT" and (was_collecting != collecting or collecting):
+            from .payment_collection import reset_payment_work
+            reset_payment_work(db, row, reset_nodes=task_scope_changed)
+        else:
+            invalidate_pending(db, data.code, reset_pre_review_task=task_scope_changed,
+                               refresh_source=mapping_changed or activated, ai_approval_changed=importing)
         log(db, actor, "导入审批模板配置" if importing else "更新审批接入配置", row.name, {
             "mode": row.mode, "rule_version": row.rules.get("version", "1.0"),
             "policy_schema_version": row.rules.get("policy_schema_version", 1),

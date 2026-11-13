@@ -3,7 +3,7 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 from uuid import uuid4
 
-from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, JSON, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 from .db import Base
 from .money import Money
@@ -78,6 +78,14 @@ class Company(Base, Timestamped):
     active: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
+class InvoiceDeductionConfig(Base):
+    """每个购买方主体独立维护抵扣规则，整组配置使用同一个乐观锁版本。"""
+    __tablename__ = "invoice_deduction_configs"
+    company_id: Mapped[str] = mapped_column(ForeignKey("companies.id"), primary_key=True)
+    version: Mapped[int] = mapped_column(Integer, default=0, server_default="0", comment="配置乐观锁版本")
+    rules: Mapped[list[dict]] = mapped_column(JSON, default=list, server_default="[]", comment="票种、费用类型和抵扣方式")
+
+
 class ModelConfig(Base, Timestamped):
     """全局单例。managed=False 时沿用部署环境，保存后整份配置由数据库管理。"""
     __tablename__ = "model_config"
@@ -127,6 +135,9 @@ class ApprovalTemplate(Base, Timestamped):
     agent_prompt: Mapped[str] = mapped_column(Text, default="", comment="节点业务审核要求；空值继承全局默认")
     ai_approval_enabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0",
         comment="是否允许此模板运行 AI 预审和按规则自动回写；默认由财务整单人工预审")
+    payment_auto_approve_enabled: Mapped[bool] = mapped_column(Boolean, server_default="0",
+        default=lambda context: context.get_current_parameters().get("business_type") == "PAYMENT",
+        comment="付款仅采集并自动同意专用节点；优先于 AI 开关和审核模式，报销固定关闭")
     mode: Mapped[str] = mapped_column(String(16), default="OBSERVE")
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     subscribed: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -140,6 +151,10 @@ class Approval(Base, Timestamped):
     template_code: Mapped[str] = mapped_column(ForeignKey("approval_templates.code"))
     business_type: Mapped[str] = mapped_column(String(24), default="REIMBURSEMENT", index=True, comment="采集时固化业务类型，历史统计不随模板配置变化")
     payment_details: Mapped[dict] = mapped_column(JSON, default=dict, comment="规范化付款字段、主体关联及未取得附件的原因")
+    payment_collection_task_id: Mapped[str | None] = mapped_column(String(32), nullable=True,
+        comment="当前付款材料采集任务；进度沿用 Job，不修改审批回写版本")
+    payment_collection_fingerprint: Mapped[str] = mapped_column(String(64), default="", server_default="",
+        comment="付款采集内容与识别配置指纹；不含待办状态或付款审核规则")
     serial_number: Mapped[str] = mapped_column(String(100), index=True)
     title: Mapped[str] = mapped_column(String(200))
     applicant: Mapped[str] = mapped_column(String(100), comment="申请人姓名；待通讯录补齐时可保存飞书身份作为展示值")
@@ -177,6 +192,66 @@ class Approval(Base, Timestamped):
     last_synced_at: Mapped[datetime] = mapped_column(DateTime, default=now, index=True, comment="最近一次权威状态读取，用于存量轮询补偿")
     raw_form: Mapped[list] = mapped_column(JSON, default=list)
     external_snapshot: Mapped[dict] = mapped_column(JSON, default=dict, comment="仅演示模式用于模拟飞书权威状态")
+
+
+class Budget(Base, Timestamped):
+    """独立周期的部门预算；空费用类别表示覆盖该部门全部类别。"""
+    __tablename__ = "budgets"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=uid)
+    name: Mapped[str] = mapped_column(String(150))
+    company_id: Mapped[str] = mapped_column(ForeignKey("companies.id"), index=True)
+    department: Mapped[str] = mapped_column(String(100), comment="审批表单业务部门名称，去除首尾空白后精确匹配")
+    expense_type: Mapped[str] = mapped_column(String(80), default="", comment="空字符串覆盖全部费用类别")
+    period_type: Mapped[str] = mapped_column(String(16), comment="MONTH / QUARTER / YEAR / CUSTOM")
+    start_date: Mapped[date] = mapped_column(Date, index=True)
+    end_date: Mapped[date] = mapped_column(Date, index=True)
+    amount: Mapped[Decimal] = mapped_column(Money(), comment="当前预算额度，整数分存储")
+    warning_threshold: Mapped[int] = mapped_column(Integer, default=80, comment="占用预警百分比，1 至 100")
+    notes: Mapped[str] = mapped_column(Text, default="")
+    archived: Mapped[bool] = mapped_column(Boolean, default=False)
+    version: Mapped[int] = mapped_column(Integer, default=1, comment="预算维护乐观锁，与审批审核版本独立")
+    __table_args__ = (UniqueConstraint("company_id", "department", "expense_type", "start_date", "end_date",
+                                     name="uq_budget_scope_period"),)
+
+
+class BudgetUsage(Base, Timestamped):
+    """每张报销唯一的预算用量事实；多个周期共享事实，禁止逐事件累加金额。"""
+    __tablename__ = "budget_usages"
+    approval_id: Mapped[str] = mapped_column(ForeignKey("approvals.id"), primary_key=True)
+    company_id: Mapped[str | None] = mapped_column(ForeignKey("companies.id"), nullable=True, index=True)
+    department: Mapped[str] = mapped_column(String(100), default="")
+    expense_type: Mapped[str] = mapped_column(String(80), default="其他费用")
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    amount: Mapped[Decimal] = mapped_column(Money(), default=Decimal("0"))
+    state: Mapped[str] = mapped_column(String(16), default="RESERVED", index=True,
+        comment="RESERVED 在途 / USED 已用 / FROZEN 冻结 / RELEASED 已释放")
+    attribution_pending: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    attribution_reason: Mapped[str] = mapped_column(String(500), default="")
+    attribution_source: Mapped[str] = mapped_column(String(16), default="AUTO", comment="AUTO 自动 / MANUAL 人工 / REVIEW 来源变化待确认")
+    source_fingerprint: Mapped[str] = mapped_column(String(64), default="")
+    approved_snapshot: Mapped[dict] = mapped_column(JSON, default=dict, comment="最后有效通过快照；历史缺失时保存带 _historical 标记的首次建账依据")
+    freeze_fingerprint: Mapped[str] = mapped_column(String(64), default="", comment="冻结依据指纹，不包含同步次数和审批审核版本")
+    released_fingerprint: Mapped[str] = mapped_column(String(64), default="", comment="已人工释放的冻结指纹；重复同步不恢复相同占用")
+    historical_review: Mapped[bool] = mapped_column(Boolean, default=False, comment="历史撤销单缺少通过快照，当前金额待财务核对")
+    version: Mapped[int] = mapped_column(Integer, default=1, comment="归属确认与预算释放使用的独立乐观锁")
+    __table_args__ = (Index("ix_budget_usages_scope", "company_id", "department", "submitted_at"),)
+
+
+class BudgetOperation(Base):
+    """预算领域操作留痕；幂等标识同时绑定操作者、目标和完整请求参数。"""
+    __tablename__ = "budget_operations"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=uid)
+    budget_id: Mapped[str | None] = mapped_column(ForeignKey("budgets.id"), nullable=True, index=True)
+    approval_id: Mapped[str | None] = mapped_column(ForeignKey("approvals.id"), nullable=True, index=True)
+    action: Mapped[str] = mapped_column(String(32))
+    actor_id: Mapped[str] = mapped_column(String(64))
+    actor_name: Mapped[str] = mapped_column(String(100))
+    reason: Mapped[str] = mapped_column(String(600), default="")
+    before: Mapped[dict] = mapped_column(JSON, default=dict)
+    after: Mapped[dict] = mapped_column(JSON, default=dict)
+    request_id: Mapped[str | None] = mapped_column(String(100), nullable=True, unique=True)
+    request_fingerprint: Mapped[str] = mapped_column(String(64), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now, index=True)
 
 
 class Invoice(Base, Timestamped):
@@ -278,6 +353,8 @@ class ApprovalAction(Base, Timestamped):
     approval_id: Mapped[str] = mapped_column(ForeignKey("approvals.id"), index=True)
     source_audit_id: Mapped[str | None] = mapped_column(ForeignKey("audit_runs.id"), nullable=True,
         comment="自动操作或整单人工同意的来源审核；执行时核对结论仍有效")
+    execution_source: Mapped[str] = mapped_column(String(32), default="STANDARD", server_default="STANDARD",
+        comment="STANDARD 原审核回写 / PAYMENT_AUTO_APPROVE 付款仅采集自动同意；后者不依赖审核结论")
     task_id: Mapped[str] = mapped_column(String(100))
     actor_id: Mapped[str] = mapped_column(String(100))
     actor_name: Mapped[str] = mapped_column(String(100))

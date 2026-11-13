@@ -27,10 +27,10 @@ from .config import settings
 from .db import SessionLocal, begin_write, get_db
 from .imports import IMPORT_COLUMNS, preview_import, read_ledger
 from .integrations import DomainError, FeishuGateway, verify_callback
-from .jobs import enqueue, start_archive_metadata_runner, start_local_runner
+from .jobs import enqueue, start_archive_metadata_runner, start_local_runner, start_payment_collection_runner
 from .agent_runtime import run_model_analysis
 from .ai_logs import AICallRecorder
-from .ai_status import invalidate_ai_audit
+from .ai_status import invalidate_ai_audit, payment_collection_enabled
 from .manual_review import full_review
 from .model_config import ENGINE, load_model_config, prepare_model_config, save_model_config
 from .sync_config import load_sync_config, save_sync_config
@@ -48,9 +48,12 @@ from .services import (StaleSnapshotError, clear_disabled_ai_state, feishu_link,
 from .storage import resolve
 from .agent_api import router as agent_router, internal as agent_internal_router, mcp_route, mcp_sessions
 from .reimbursement_api import router as reimbursement_router
+from .payment_statistics_api import router as payment_statistics_router
+from .budget_api import router as budget_router
 from .template_api import router as template_router
-from .template_config import apply_template_config, set_template_ai_approval
+from .template_config import apply_template_config, set_template_ai_approval, set_template_payment_auto_approval
 from .feishu_api import router as feishu_config_router
+from .invoice_deduction_api import router as invoice_deduction_router
 from .feishu_config import effective_public_url, ensure_feishu_config, load_feishu_config
 from .agent_chat_runtime import manager as agent_manager
 from .agent_attachments import attachment_manager
@@ -72,12 +75,18 @@ async def lifespan(_app):
             print("YOUJU 安装初始化码：" + installation_code + "（首次绑定后失效，请在网页接入向导输入）", flush=True)
         db.execute(text("SELECT 1"))
         seed_demo(db)
+        from .budgets import seed_demo_budgets
+        seed_demo_budgets(db)
         begin_write(db)
+        from .payment_collection import restore_payment_work
+        restore_payment_work(db)
         settle_disabled_ai_work(db)
         # 代码升级也会改变审批资格：旧策略下的 PASS 必须先失效，禁止待执行操作沿用旧结论。
         pending = select(Approval, ApprovalTemplate.ai_approval_enabled).join(ApprovalTemplate).where(
             Approval.status == "PENDING")
         for approval, ai_enabled in db.execute(pending):
+            if payment_collection_enabled(db.get(ApprovalTemplate, approval.template_code)):
+                continue
             reviewed = bool(full_review(db, approval))
             if not ai_enabled:
                 if clear_disabled_ai_state(approval, reviewed=reviewed):
@@ -99,6 +108,8 @@ async def lifespan(_app):
     runner = start_local_runner()
     _app.state.runner = runner
     archive_runner = start_archive_metadata_runner()
+    collection_runner = start_payment_collection_runner()
+    _app.state.collection_runner = collection_runner
     print_manager.start()
     agent_manager.start()
     attachment_manager.start()
@@ -111,9 +122,11 @@ async def lifespan(_app):
             await run_in_threadpool(attachment_manager.shutdown)
             await run_in_threadpool(print_manager.shutdown)
             archive_runner[0].set()
+            collection_runner[0].set()
             runner[0].set()
             await run_in_threadpool(runner[1].join, 100)
             await run_in_threadpool(archive_runner[1].join, 10)
+            await run_in_threadpool(collection_runner[1].join, 10)
 
 
 app = FastAPI(title="有据 · 飞书审批财务工作台", version="1.0.0",
@@ -122,8 +135,11 @@ app = FastAPI(title="有据 · 飞书审批财务工作台", version="1.0.0",
 app.include_router(auth_router)
 app.include_router(agent_router)
 app.include_router(reimbursement_router)
+app.include_router(payment_statistics_router)
+app.include_router(budget_router)
 app.include_router(template_router)
 app.include_router(feishu_config_router)
+app.include_router(invoice_deduction_router)
 app.include_router(archive_router)
 app.include_router(agent_internal_router)
 app.router.routes.append(mcp_route)
@@ -190,6 +206,9 @@ def ready(request: Request, db=Depends(get_db)):
     runner = getattr(request.app.state, "runner", None)
     if not runner or runner[0].is_set() or not runner[1].is_alive():
         raise HTTPException(503, "持久化任务处理器尚未就绪")
+    collection_runner = getattr(request.app.state, "collection_runner", None)
+    if not collection_runner or collection_runner[0].is_set() or not collection_runner[1].is_alive():
+        raise HTTPException(503, "付款材料采集处理器尚未就绪")
     return {"status": "ready"}
 
 
@@ -322,7 +341,7 @@ def correct_attachment(approval_id: str, attachment_id: str, data: s.CorrectionI
 
 
 @app.post("/api/v1/approvals/{approval_id}/attachments/{attachment_id}/material", response_model=s.JobOut,
-          tags=["审批中心"], summary="保存人工确认的付款材料类别，按模板配置同步或重审")
+          tags=["审批中心"], summary="保存人工确认的附件材料类别，按模板配置同步或重审")
 def confirm_payment_material(approval_id: str, attachment_id: str, data: s.MaterialConfirmationInput,
                              user=Depends(finance_user), db=Depends(get_db)):
     from .payment_service import confirm_material
@@ -545,6 +564,18 @@ def update_template_ai_approval(template_code: str, data: s.TemplateAIApprovalIn
                                 user=Depends(admin_user), db=Depends(get_db)):
     """管理员显式切换 AI 预审，切换后进入观察模式；重复保存同一状态不会重复安排任务。"""
     row = set_template_ai_approval(db, template_code, data.ai_approval_enabled, user.name)
+    if row is None:
+        raise HTTPException(404, "模板不存在")
+    db.commit()
+    return row
+
+
+@app.put("/api/v1/templates/{template_code}/payment-auto-approval", response_model=s.TemplateOut, tags=["接入配置"],
+         summary="开启或关闭付款模板的仅采集自动同意")
+def update_template_payment_auto_approval(template_code: str, data: s.TemplatePaymentAutoApprovalInput,
+                                          user=Depends(admin_user), db=Depends(get_db)):
+    """仅付款模板可用；包含存量专用待办，原审核配置保留，实际回写始终先核对飞书。"""
+    row = set_template_payment_auto_approval(db, template_code, data.payment_auto_approve_enabled, user.name)
     if row is None:
         raise HTTPException(404, "模板不存在")
     db.commit()

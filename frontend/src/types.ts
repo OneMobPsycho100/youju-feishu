@@ -1,3 +1,5 @@
+import type { BudgetContext } from "./budgetTypes";
+
 /** 工作台角色由后端鉴权，前端隐藏操作仅用于改善交互。 */
 export interface User {
   id: string;
@@ -38,6 +40,15 @@ export interface Approval {
   template_code: string;
   business_type: BusinessType;
   payment_details: PaymentDetails;
+  /** 付款仅采集模式优先于原审核配置；业务规则和解析异常不阻止专用节点自动同意。 */
+  payment_auto_approve_enabled: boolean;
+  /** 独立材料采集进度，完成不表示已通过付款审核或最终审批。 */
+  payment_collection_status: AIApprovalStatus;
+  payment_collection_task_id: string | null;
+  /** 材料读取、票面识别与占用异常仅作记录。 */
+  payment_collection_issues: { code: string; filename: string; detail: string }[];
+  /** 当前专用节点的自动同意状态，与飞书最终审批及采集进度独立。 */
+  payment_auto_approval_status: "NOT_STARTED" | "REQUESTED" | "EXECUTING" | "UNKNOWN" | "SUCCEEDED" | "FAILED";
   serial_number: string;
   title: string;
   /** 申请人展示姓名，优先使用工作台登录姓名，其次使用已补齐的飞书通讯录姓名，缺失时沿用审批原值。 */
@@ -104,7 +115,7 @@ export interface RecognitionSource {
     lines: { text: string; score?: number | null; box: number[][] }[];
   }[];
 }
-/** PDF 本地优先，缺失或歧义字段可由清晰模型结果兜底；图片须独立来源一致。 */
+/** PDF 本地优先；图片 OCR 主识别，模型仅在同票身份一致时补缺。 */
 export interface RecognitionComparison {
   field: string;
   label: string;
@@ -124,6 +135,22 @@ export interface AttachmentArchive {
 }
 
 export interface ParsedData {
+  /** 整份内容分类独立于字段来源；分类失败不能当作普通附件跳过。 */
+  classification?: {
+    status: "COMPLETED" | "UNKNOWN" | "FAILED";
+    material_type: MaterialType;
+    complete: boolean;
+    reason: string;
+    source: "MODEL" | "MANUAL";
+    pages: number[];
+    invoice_pages: number[];
+    invoice_count: number;
+    version: string;
+    model_call_id?: string;
+    cached?: boolean;
+  } | null;
+  /** 当前 PDF、图片分类及字段采用版本；不改变历史参考材料用途。 */
+  document_policy_version?: string;
   archive?: AttachmentArchive | null;
   /** 历史包内 PDF 的本地识别结果，与台账状态独立。 */
   reference_pdf?: "INVOICE" | "TRAVEL" | "REVIEW" | null;
@@ -154,8 +181,8 @@ export interface ParsedData {
   pdf_parser_version?: string;
   sources?: Record<string, RecognitionSource>;
   recognition?: {
-    /** LOCAL 为 PDF 本地字段完整；VERIFIED 为 PDF 模型兜底完成或图片交叉核对通过。 */
-    status: "LOCAL" | "VERIFIED" | "STRUCTURED" | "UNCERTAIN";
+    /** LOCAL 为 PDF 本地完整；VERIFIED 为模型兜底或历史交叉核对；OCR 为图片 OCR 主识别完成。 */
+    status: "LOCAL" | "VERIFIED" | "STRUCTURED" | "OCR" | "UNCERTAIN";
     reason: string;
     comparisons: RecognitionComparison[];
   };
@@ -186,12 +213,33 @@ export interface InvoiceDisplayDetails {
   /** 票面总税额和不含税金额，单位元，以十进制字符串传输。 */
   tax_amount: string | null;
   untaxed_amount: string | null;
+  /** 单票价税合计，单位元，以十进制字符串展示为可报销金额。 */
+  reimbursable_amount: string | null;
+  /** 按主体规则确认的抵扣税率，13 表示 13%；缺失或冲突时为空。 */
+  deductible_tax_rate: string | null;
+  /** 按主体规则计算的抵扣税额，单位元，十进制字符串；待确认时为空。 */
+  deductible_tax_amount: string | null;
 }
 /** 当前审批的已识别发票按票去重，金额缺项时对应列合计为空。 */
 export interface InvoiceTotals {
   amount: string;
   tax_amount: string | null;
   untaxed_amount: string | null;
+  /** 去重后的抵扣税额合计，单位元；任一张发票待确认时为空。 */
+  deductible_tax_amount: string | null;
+}
+/** 主体在指定票种和审批费用类型下的抵扣方式。 */
+export interface InvoiceDeductionRule {
+  billing_type: string;
+  expense_type: string;
+  /** FULL 按票面税额全额抵扣，NONE 明确不抵扣。 */
+  mode: "FULL" | "NONE";
+}
+/** 管理员读取的主体规则；保存时将 version 作为 expected_version 提交。 */
+export interface InvoiceDeductionConfiguration {
+  version: number;
+  rules: InvoiceDeductionRule[];
+  billing_types: string[];
 }
 export interface Invoice extends Required<InvoiceFields> {
   id: string;
@@ -273,6 +321,8 @@ export interface ManualReview {
   promoted_at?: string | null;
 }
 export interface ActionRecord {
+  /** STANDARD 为原审核操作；PAYMENT_AUTO_APPROVE 为仅采集自动同意。 */
+  execution_source: "STANDARD" | "PAYMENT_AUTO_APPROVE";
   id: string;
   action: string;
   actor_name: string;
@@ -297,6 +347,8 @@ export interface FeishuFormField {
 }
 
 export interface ApprovalDetail extends Approval {
+  /** 本单预算事实及已包含本单占用的实时指标；付款申请为空。 */
+  budget_context?: BudgetContext | null;
   /** 工作台报销详情的本地飞书表单快照，兼容尚未返回此字段的服务端。 */
   feishu_form?: FeishuFormField[];
   attachments: Attachment[];
@@ -426,6 +478,8 @@ export interface AuditRuleEntry extends CustomAuditRule {
   parameters: { comparison?: "AT_LEAST" | "EXACT"; require_completed?: boolean };
 }
 export interface ApprovalTemplate {
+  /** 仅付款可开启；默认开启，优先于 AI 开关与 mode，原配置保留供关闭后恢复。 */
+  payment_auto_approve_enabled: boolean;
   code: string;
   name: string;
   business_type: BusinessType;

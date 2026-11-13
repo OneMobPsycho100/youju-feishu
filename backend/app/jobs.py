@@ -47,9 +47,12 @@ def process_job(job_id: str) -> None:
     from .imports import commit_import
     from .integrations import DomainError
     from .ai_logs import flush_call_snapshots
-    from .reimbursement_metadata import backfill_applicant_name, backfill_metadata
+    from .reimbursement_metadata import (PAYMENT_APPROVAL_TIME_JOB, backfill_applicant_name, backfill_metadata,
+                                         backfill_payment_approval_time)
     from .archive_metadata import backfill_archive
+    from .budgets import backfill_usage
     from .reference_pdfs import JOB_KIND as REFERENCE_PDF_JOB, recognize_reference_pdfs
+    from .payment_collection import JOB_KIND as PAYMENT_COLLECT_JOB, collect_payment
 
     with SessionLocal() as db:
         begin_write(db)
@@ -73,7 +76,10 @@ def process_job(job_id: str) -> None:
                           "ACTION": services.execute_action, "EVENT": services.handle_event,
                           "SYNC": services.sync_all, "IMPORT": commit_import, "REFRESH": services.refresh_original,
                           "REIMBURSEMENT_METADATA": backfill_metadata, "APPROVAL_APPLICANT_NAME": backfill_applicant_name,
+                          PAYMENT_APPROVAL_TIME_JOB: backfill_payment_approval_time,
                           "ARCHIVE_METADATA": backfill_archive, REFERENCE_PDF_JOB: recognize_reference_pdfs}
+            operations["BUDGET_USAGE_BACKFILL"] = backfill_usage
+            operations[PAYMENT_COLLECT_JOB] = collect_payment
             # 只限制调度器创建的自动任务；手动补偿任务没有 sync: 幂等前缀。
             if kind == "SYNC" and (job.dedupe_key or "").startswith("sync:") and (
                     settings().app_mode != "live" or not load_sync_config(db).enabled):
@@ -111,9 +117,10 @@ def process_job(job_id: str) -> None:
             flush_call_snapshots(db)
 
 
-def pending_ids(*, archive_metadata=False) -> list[str]:
+def pending_ids(*, archive_metadata=False, payment_collection=False) -> list[str]:
     """回收超过二十分钟的执行租约，再读取已提交、到执行时间的任务。"""
     from .reference_pdfs import JOB_KIND as REFERENCE_PDF_JOB
+    from .reimbursement_metadata import PAYMENT_APPROVAL_TIME_JOB
 
     with SessionLocal() as db:
         begin_write(db)
@@ -129,10 +136,15 @@ def pending_ids(*, archive_metadata=False) -> list[str]:
         db.commit()
         statement = select(Job.id).where(Job.status == "PENDING", Job.available_at <= now())
         archive_kinds = ("ARCHIVE_METADATA", REFERENCE_PDF_JOB)
-        statement = statement.where(Job.kind.in_(archive_kinds) if archive_metadata else Job.kind.not_in(archive_kinds))
+        if payment_collection:
+            statement = statement.where(Job.kind == "PAYMENT_COLLECT")
+        else:
+            statement = statement.where(Job.kind.in_(archive_kinds) if archive_metadata
+                else Job.kind.not_in((*archive_kinds, "PAYMENT_COLLECT")))
         if settings().app_mode == "live" and not feishu_ready(db):
             statement = statement.where(Job.kind.not_in([
                 "SYNC", "EVENT", "ACTION", "REFRESH", "REIMBURSEMENT_METADATA", "APPROVAL_APPLICANT_NAME", "ARCHIVE_METADATA",
+                PAYMENT_APPROVAL_TIME_JOB,
             ]))
         return list(db.scalars(statement.order_by(Job.created_at).limit(20)))
 
@@ -166,9 +178,16 @@ def start_local_runner() -> tuple[threading.Event, threading.Thread]:
 
     def loop():
         from .reimbursement_metadata import schedule_metadata
+        from .budgets import schedule_backfill
         last_metadata = 0
+        last_budget_backfill = float("-inf")
         while not stopped.wait(1):
             try:
+                # 预算建账只读取本地业务快照，飞书尚未接入时也能补齐历史记录。
+                if time.monotonic() - last_budget_backfill >= 5:
+                    with SessionLocal() as db:
+                        schedule_backfill(db, enqueue)
+                    last_budget_backfill = time.monotonic()
                 # 统计元数据和姓名补齐使用独立间隔，不受自动审批同步开关影响。
                 if (int(now().timestamp()) - last_metadata >= settings().sync_interval_seconds
                         and (settings().app_mode != "live" or feishu_ready())):
@@ -184,6 +203,25 @@ def start_local_runner() -> tuple[threading.Event, threading.Thread]:
                 logger.error("local_dispatch error_type=%s", type(exc).__name__)
 
     thread = threading.Thread(target=loop, name="finance-jobs", daemon=True)
+    thread.start()
+    return stopped, thread
+
+
+def start_payment_collection_runner() -> tuple[threading.Event, threading.Thread]:
+    """付款材料读取独立消费，模型慢请求或解析重试不占用审批回写线程。"""
+    stopped = threading.Event()
+
+    def loop():
+        while not stopped.wait(1):
+            try:
+                for job_id in pending_ids(payment_collection=True):
+                    if stopped.is_set():
+                        break
+                    process_job(job_id)
+            except Exception as exc:
+                logger.error("payment_collection_dispatch error_type=%s", type(exc).__name__)
+
+    thread = threading.Thread(target=loop, name="payment-collection", daemon=True)
     thread.start()
     return stopped, thread
 

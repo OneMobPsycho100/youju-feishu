@@ -6,6 +6,7 @@ from fastapi import HTTPException
 from sqlalchemy import select
 
 from .attachment_archives import archive_readonly
+from .ai_status import can_run_ai_approval
 from .db import begin_write
 from .integrations import DomainError
 from .jobs import enqueue
@@ -55,12 +56,16 @@ def confirm_material(db, approval_id, attachment_id, data, user):
     begin_write(db)
     approval, attachment = db.get(Approval, approval_id), db.get(Attachment, attachment_id)
     if not approval or not attachment or attachment.approval_id != approval_id or not attachment.active:
-        raise HTTPException(404, "付款申请或当前附件不存在")
+        raise HTTPException(404, "审批单或当前附件不存在")
     if archive_readonly(db, attachment):
         raise DomainError("请在正常解包的成员原件上确认材料类别")
     template = db.get(ApprovalTemplate, approval.template_code)
-    if approval.business_type != "PAYMENT" or approval.version != data.expected_version:
-        raise DomainError("审批内容已变化或不是付款申请，请刷新后重试")
+    if approval.version != data.expected_version:
+        raise DomainError("审批内容已变化，请刷新后重试")
+    if approval.business_type != "PAYMENT" and data.material_type not in {"INVOICE", "OTHER"}:
+        raise DomainError("报销附件请选择发票或普通附件")
+    if approval.business_type != "PAYMENT" and attachment.mime != "application/pdf" and not attachment.mime.startswith("image/"):
+        raise DomainError("仅 PDF 或图片附件需要确认发票类别")
     if (not template.active or approval.status != "PENDING" or approval.task_status != "PENDING"
             or approval.assignee != template.reviewer_open_id):
         raise DomainError("当前不是可处理的专用预审待办")
@@ -77,12 +82,20 @@ def confirm_material(db, approval_id, attachment_id, data, user):
         material.update(segments=[], summary="", error="")
     material.update(confirmation=confirmation, complete=False)
     parsed["material_type"] = data.material_type
+    if data.material_type != "INVOICE" and parsed.get("confirmed"):
+        # 尚未入台账的人工候选允许改为普通材料；保留旧字段依据，避免旧 confirmed 绕过新分类。
+        parsed["previous_invoice_parse"] = {key: copy.deepcopy(parsed.get(key)) for key in
+            ("fields", "confirmed_by", "confirmed_at", "confirmation_comment")}
+        parsed.update(confirmed=False, fields={}, error="")
+    parsed.pop("classification", None)
+    if not parsed.get("confirmed"):
+        parsed.pop("cache_key", None)
     attachment.parsed_data = parsed
     approval.version += 1
     approval.decision, approval.audit_attachment_version = "PENDING", ""
-    approval.audit_requested = template.ai_approval_enabled
-    log(db, user.name, "确认付款材料类别", approval.serial_number, {"attachment_id": attachment_id, **confirmation})
-    if template.ai_approval_enabled:
+    approval.audit_requested = can_run_ai_approval(template)
+    log(db, user.name, "确认附件材料类别", approval.serial_number, {"attachment_id": attachment_id, **confirmation})
+    if can_run_ai_approval(template):
         job = enqueue(db, "AUDIT", {"instance_code": approval_id, "only_if_needed": True})
     else:
         job = enqueue(db, "REFRESH", {"instance_code": approval_id})

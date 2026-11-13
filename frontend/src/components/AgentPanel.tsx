@@ -15,6 +15,7 @@ import type { AgentAttachment, AgentCapabilities, AgentContext, AgentConversatio
 import { AgentUsagePanel } from "./AgentUsagePanel";
 import { AgentAttachmentCard, AgentAttachmentPicker, attachmentUrl } from "./AgentAttachments";
 import { requestId } from "../requestId";
+import { budgetMoney, budgetStatusLabels, type BudgetStatus } from "../budgetTypes";
 
 const record = (value: unknown): Record<string, unknown> => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 const str = (value: unknown) => typeof value === "string" || typeof value === "number" ? String(value) : "";
@@ -118,6 +119,20 @@ function ResultCards({ result, preview }: { result: Record<string, unknown>; pre
       <Button size="small" type="link" onClick={() => preview({ url: attachmentUrl(str(file.id), true), title: str(file.filename) })}>核对上传原件</Button>
     </div>;
   }
+  if (entity === "budget" || entity === "budgets") {
+    const budgets = entity === "budget" ? [result] : records(result.items);
+    return <div className="agent-business-card"><div className="agent-result-label">部门预算 · 实时查询{result.total !== undefined && ` · 共${str(result.total)}项`}</div>
+      {!budgets.length && <p>当前条件下暂无预算。</p>}
+      {budgets.map((item) => <div className="agent-result-item" key={str(item.id)}>
+        <div className="agent-result-heading"><strong>{str(item.name)}</strong><Tag>{budgetStatusLabels[str(item.budget_status) as BudgetStatus] || "预算状态"}</Tag></div>
+        <div className="agent-result-meta">{str(item.company_name)} · {str(item.department)} · {str(item.expense_type) || "全部费用"}</div>
+        <p>额度 ¥{budgetMoney(str(item.amount))} · 可用 ¥{budgetMoney(str(item.available_amount))}</p>
+        <small>已使用 ¥{budgetMoney(str(item.used_amount))} · 在途 ¥{budgetMoney(str(item.reserved_amount))} · 冻结 ¥{budgetMoney(str(item.frozen_amount))}</small>
+        <Button type="link" size="small" onClick={() => { window.location.hash = `/budgets/${str(item.id)}`; }}>查看预算 →</Button>
+      </div>)}<small>各预算独立核算，金额不跨预算叠加。</small>
+      {Number(record(result.completeness).pending_count) > 0 && <p className="agent-error-text">存在待归属报销，余额仅基于已归属数据。</p>}
+    </div>;
+  }
   if (entity === "overview") return <div className="agent-business-card"><div className="agent-result-label">财务概况 · 实时查询</div>
     <div className="agent-metrics">{[["待处理", result.pending_count], ["需复核", result.review_count], ["预审通过", result.pass_count], ["已归档原件", result.archived_count]].map(([label, value]) =>
       <div key={str(label)}><strong>{str(value)}</strong><span>{str(label)}</span></div>)}</div>
@@ -141,7 +156,7 @@ function ResultCards({ result, preview }: { result: Record<string, unknown>; pre
   }
   const items = entity === "job" ? [result] : records(result.items);
   if (!items.length) return <div className="agent-query-empty">本次查询未找到匹配记录。</div>;
-  return <div className="agent-business-card"><div className="agent-result-label">{{ approvals: "审批记录", archived_approvals: "审批归档", invoices: "发票与占用", archives: "归档原件", jobs: "后台任务", job: "任务状态", companies: "公司主体" }[entity] || "查询结果"}
+  return <div className="agent-business-card"><div className="agent-result-label">{{ approvals: "审批记录", archived_approvals: "审批归档", invoices: "发票与占用", archives: "归档原件", jobs: "后台任务", job: "任务状态", companies: "公司主体", budget_usages: "预算报销明细" }[entity] || "查询结果"}
     {result.total !== undefined && <span>共 {str(result.total)} 条 · 显示 {items.length} 条</span>}</div>
     <div className="agent-result-list">{items.map((item, index) => <div className="agent-result-item" key={str(item.id) || index}>
       <div className="agent-result-heading"><strong>{str(item.title || item.number || item.archive_path || item.name || `${str(item.kind)} · ${str(item.id).slice(0, 10)}`)}</strong>

@@ -33,5 +33,8 @@ data/
 .openai/
 .playwright-mcp/
 deploy/
-docs/
+# 公开功能说明随代码交付，其余本机文档和验证资料仍保持忽略。
+docs/*
+!docs/budget-management.md
+!docs/reimbursement-statistics.md
 /scripts

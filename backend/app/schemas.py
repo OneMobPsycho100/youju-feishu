@@ -5,6 +5,7 @@ from typing import Annotated, Any, Generic, Literal, TypeVar
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, StringConstraints, field_validator, model_validator
 from typing_extensions import TypedDict
 from .audit_policy import BUILTIN_DEFAULT_ACTIONS, BUSINESS_DEFAULT_ACTIONS
+from .budget_schemas import BudgetContext
 
 
 class Schema(BaseModel):
@@ -135,6 +136,8 @@ class TemplateConfig(Schema):
     agent_prompt: str = Field("", max_length=20000, description="Agent 节点业务审核要求，空字符串继承全局默认；不覆盖系统输出约定")
     mode: Literal["OBSERVE", "AUTO"] = Field("OBSERVE", description="观察模式或按规则自动同意、拒绝")
     active: bool = Field(True, description="是否接收此模板的业务事件")
+    payment_auto_approve_enabled: bool = Field(False, strict=True,
+        description="付款仅采集并自动同意专用节点，优先于 AI 和自动模式；新付款省略时默认开启，旧模板省略时保留原值，报销不得开启")
 
 
 class TemplateInput(TemplateConfig):
@@ -152,8 +155,13 @@ class TemplateAIApprovalInput(Schema):
     ai_approval_enabled: bool = Field(strict=True, description="开启后允许模板运行 AI 预审，关闭后由财务整单人工预审")
 
 
+class TemplatePaymentAutoApprovalInput(Schema):
+    payment_auto_approve_enabled: bool = Field(strict=True,
+        description="付款模板仅采集开关；开启后包含存量专用待办，材料解析或历史审核异常不阻止自动同意")
+
+
 class TemplateOut(TemplateConfig):
-    ai_approval_enabled: bool = Field(description="模板的 AI 审批开关，自动同意和拒绝还需开启自动模式")
+    ai_approval_enabled: bool = Field(description="模板保存的 AI 审批开关；付款仅采集时暂停生效，原自动同意和拒绝还需开启自动模式")
     node_ids: list[str] = Field(description="当前配置的所有专用预审节点 ID 或 custom_node_id")
     node_id: str = Field(description="首个专用预审节点 ID，兼容旧版接口")
     subscribed: bool = Field(description="是否完成原生审批定义事件订阅")
@@ -175,8 +183,16 @@ class PaymentDetails(Schema):
 
 
 class ApprovalOut(Schema):
+    payment_auto_approve_enabled: bool = Field(False, description="所属付款模板当前仅采集并自动同意；审核结论仅作历史记录")
+    payment_collection_status: Literal["NOT_STARTED", "QUEUED", "RUNNING", "COMPLETED", "FAILED"] = Field("NOT_STARTED",
+        description="独立材料采集进度，与 AI 审核和飞书回写状态无关")
+    payment_collection_task_id: str | None = Field(None, description="当前材料采集后台任务 ID，失败可通过现有任务重试接口重试")
+    payment_collection_issues: list[dict[str, str]] = Field(default_factory=list,
+        description="材料读取、发票识别及占用冲突记录，仅作提示，不阻止付款预审放行")
+    payment_auto_approval_status: Literal["NOT_STARTED", "REQUESTED", "EXECUTING", "UNKNOWN", "SUCCEEDED", "FAILED"] = Field("NOT_STARTED",
+        description="当前专用待办的仅采集自动同意回写状态；成功仅表示该节点同意，最终状态以飞书为准")
     manual_review_valid: bool = Field(False, description="当前整单人工结论是否有效，独立于 AI 进度和审核配置")
-    ai_approval_enabled: bool = Field(False, description="当前审批所属模板是否允许 AI 预审")
+    ai_approval_enabled: bool = Field(False, description="当前生效的 AI 预审开关；付款仅采集时为 false，模板原保存值不变")
     id: str = Field(description="飞书 instance_code")
     template_code: str = Field(description="飞书 approval_code")
     business_type: Literal["REIMBURSEMENT", "PAYMENT"] = Field("REIMBURSEMENT", description="审批实例固化的业务类型")
@@ -211,6 +227,9 @@ class InvoiceDisplayOut(Schema):
     expense_type: str | None = Field(None, description="当前报销单的费用类型；台账取有效占用关联的报销单，无来源时为空")
     tax_amount: Decimal | None = Field(None, description="票面总税额，单位元，十进制字符串；缺失或冲突时为空")
     untaxed_amount: Decimal | None = Field(None, description="票面不含税金额合计，单位元，十进制字符串；缺失或冲突时为空")
+    reimbursable_amount: Decimal | None = Field(None, description="单票价税合计，单位元，以十进制字符串展示为可报销金额")
+    deductible_tax_rate: Decimal | None = Field(None, description="按主体规则确认的单一抵扣税率，十进制字符串，13 表示 13%；待确认时为空")
+    deductible_tax_amount: Decimal | None = Field(None, description="按主体规则计算的可抵扣税额，单位元，十进制字符串；待确认时为空")
 
 
 class InvoiceTotalsOut(Schema):
@@ -218,6 +237,7 @@ class InvoiceTotalsOut(Schema):
     amount: Decimal = Field(description="价税合计之和，单位元，十进制字符串")
     tax_amount: Decimal | None = Field(description="总税额之和，单位元；任一张发票缺值时为空")
     untaxed_amount: Decimal | None = Field(description="不含税金额之和，单位元；任一张发票缺值时为空")
+    deductible_tax_amount: Decimal | None = Field(None, description="去重后可抵扣税额之和，单位元，十进制字符串；任一张发票待确认时为空")
 
 
 class InvoiceOut(Schema):
@@ -270,14 +290,14 @@ class RecognitionComparisonOut(Schema):
     required: bool = Field(description="此票种是否要求该字段；数电票代码不适用")
     values: dict[str, str] = Field(description="按 TEXT / TENCENT_OCR / MODEL / XML 等来源保存的候选值，历史本地来源为 OCR")
     accepted: str = Field(description="PDF/XML 本地有效字段或独立来源一致后采用的规范值；未解决时为空")
-    matched_sources: list[str] = Field(description="支持采用值的来源；PDF 本地文字层和 XML 允许单路，图片须至少两路")
+    matched_sources: list[str] = Field(description="支持采用值的来源；PDF 本地、XML 或完整图片 OCR 可单路采用，模型补缺需通过同票身份核对")
     status: Literal["AGREED", "CONFLICT", "MISSING", "NOT_REQUIRED"] = Field(description="已一致、存在分歧、缺少一致证据或票种不适用")
 
 
 class RecognitionOut(Schema):
     model_config = ConfigDict(from_attributes=True, extra="allow")
-    status: Literal["LOCAL", "VERIFIED", "STRUCTURED", "UNCERTAIN"] = Field(
-        description="LOCAL 为 PDF 本地字段完整，VERIFIED 为图片交叉核对通过，STRUCTURED 为完整 XML，UNCERTAIN 为待确认；不代表税务验真")
+    status: Literal["LOCAL", "VERIFIED", "STRUCTURED", "OCR", "UNCERTAIN"] = Field(
+        description="LOCAL 为 PDF 本地完整，VERIFIED 为模型兜底或历史交叉核对，OCR 为图片 OCR 主识别完成，STRUCTURED 为完整 XML，UNCERTAIN 为待确认；不代表税务验真")
     reason: str = Field(description="一致性结论或尚未解决字段的中文说明")
     comparisons: list[RecognitionComparisonOut] = Field(default_factory=list, description="逐字段候选对比及采用依据")
 
@@ -310,6 +330,21 @@ class AttachmentArchiveOut(Schema):
     members: list[ArchiveMemberOut] = Field(description="可取得的同版本成员，按包内目录顺序")
 
 
+class DocumentClassificationOut(Schema):
+    """整份附件分类证据；不暴露分类请求中的内部票面候选，不作为重复字段计票。"""
+    status: Literal["COMPLETED", "UNKNOWN", "FAILED"] = Field(description="分类完成、内容不确定或分类调用失败")
+    material_type: Literal["INVOICE", "CONTRACT", "QUOTE", "OTHER", "UNKNOWN"] = Field(description="原件实际内容类别")
+    complete: bool = Field(description="模型已完整检查全部页面，或财务已明确确认当前原件")
+    reason: str = Field(description="分类依据或未完成原因")
+    source: Literal["MODEL", "MANUAL"] = Field(description="模型分类或绑定当前原件的人工确认")
+    pages: list[int] = Field(default_factory=list, description="模型完整检查的页码；人工确认可为空")
+    invoice_pages: list[int] = Field(default_factory=list, description="实际包含发票票面的页码")
+    invoice_count: int = Field(description="不同发票数量；同票跨页只计一次")
+    version: str = Field(description="分类策略版本")
+    model_call_id: str = Field("", description="分类模型调用日志 ID；人工确认时为空")
+    cached: bool = Field(False, description="是否复用同一原件及模型配置下的完整分类")
+
+
 class ParsedInvoiceDataOut(Schema):
     """兼容旧解析记录，人工确认与原始识别证据分别保存，不改写历史意见。"""
     model_config = ConfigDict(from_attributes=True, extra="allow")
@@ -329,7 +364,9 @@ class ParsedInvoiceDataOut(Schema):
     pipeline_version: str = Field("", description="识别策略版本；旧记录可能为空")
     sources: dict[str, RecognitionSourceOut] = Field(default_factory=dict, description="各个独立来源的候选及失败原因")
     recognition: RecognitionOut | None = Field(None, description="本地解析或交叉核对结论；旧记录可能尚无识别结论")
-    material_type: Literal["INVOICE", "CONTRACT", "QUOTE", "OTHER", "UNKNOWN"] = Field("INVOICE", description="付款材料分类；历史报销附件默认发票")
+    material_type: Literal["INVOICE", "CONTRACT", "QUOTE", "OTHER", "UNKNOWN"] = Field("INVOICE", description="附件内容分类；历史未分类记录兼容原默认值")
+    classification: DocumentClassificationOut | None = Field(None, description="PDF、图片整份分类证据；旧记录和结构化原件可为空")
+    document_policy_version: str = Field("", description="PDF、图片分类及字段采用策略版本")
     material: PaymentMaterialOut = Field(default_factory=dict, description="付款材料完整读取状态、定位文本片段、阅读范围和分类依据")
     archive: AttachmentArchiveOut | None = Field(None, description="仅压缩包原件返回，含展开状态、用途和包内文件")
     reference_pdf: Literal["INVOICE", "TRAVEL", "REVIEW"] | None = Field(
@@ -421,6 +458,8 @@ class ActionInput(Schema):
 
 
 class ActionOut(Schema):
+    execution_source: Literal["STANDARD", "PAYMENT_AUTO_APPROVE"] = Field("STANDARD",
+        description="原审核操作或付款仅采集放行；仅采集操作没有来源审核且只能同意指定节点")
     id: str = Field(description="操作记录 ID")
     action: str = Field(description="APPROVE / REJECT")
     actor_name: str = Field(description="实际工作台操作者")
@@ -462,6 +501,7 @@ class ReferencePdfSummary(Schema):
 
 
 class ApprovalDetail(ApprovalOut):
+    budget_context: BudgetContext | None = Field(None, description="报销预算归属与独立预算实时指标；付款申请为空，预算提醒不改变审批结论")
     feishu_form: list[FeishuFormField] = Field(default_factory=list, description="工作台报销详情使用的本地飞书表单快照；按原顺序排列，无可用快照或为付款时为空")
     attachments: list[AttachmentOut] = Field(description="全部附件版本，包含历史版本")
     invoices: list[InvoiceOut] = Field(description="当前附件识别到的发票")

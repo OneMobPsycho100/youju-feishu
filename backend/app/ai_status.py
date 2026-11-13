@@ -3,21 +3,42 @@ from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from .models import Approval, ApprovalTemplate, Job, now
+from .pre_review import has_pending_pre_review_task
 
 
 ACTIVE_AI_STATUSES = ("QUEUED", "RUNNING")
 
 
+def payment_collection_enabled(template: ApprovalTemplate | None) -> bool:
+    """判断付款策略，不含 active；停用模板仍需展示其配置，实际任务另校验接入状态。"""
+    return bool(template and template.business_type == "PAYMENT" and template.payment_auto_approve_enabled)
+
+
 def can_run_ai_approval(template: ApprovalTemplate | None) -> bool:
-    """模板接入和 AI 审批开关均开启时才允许进入后台预审。"""
-    return bool(template and template.active and template.ai_approval_enabled)
+    """模板接入与 AI 开关开启且未采用付款仅采集策略时，才允许进入后台预审。"""
+    return bool(template and template.active and template.ai_approval_enabled and not payment_collection_enabled(template))
+
+
+def can_run_automatic_audit(approval: Approval | None, template: ApprovalTemplate | None) -> bool:
+    """自动预审必须同时满足模板策略和专用待办资格；人工重审、归档补审另走各自入口。"""
+    return can_run_ai_approval(template) and has_pending_pre_review_task(approval, template)
+
+
+def automatic_audit_job(job: Job) -> bool:
+    """兼容旧补偿任务只有幂等前缀、尚未携带 only_if_needed 的情况。"""
+    from .jobs import COMPENSATION_AUDIT_PREFIX
+    return job.kind == "AUDIT" and bool(
+        job.payload.get("only_if_needed") or (job.dedupe_key or "").startswith(COMPENSATION_AUDIT_PREFIX))
 
 
 def queue_ai_audit(db: Session, job: Job) -> None:
     """仅预审任务入队时绑定进度。回调先同步，归档需要补审时才开始显示预审进度。"""
     target = job.payload.get("instance_code") if job.kind == "AUDIT" else None
     approval = db.get(Approval, target) if target else None
-    if approval and can_run_ai_approval(db.get(ApprovalTemplate, approval.template_code)):
+    template = db.get(ApprovalTemplate, approval.template_code) if approval else None
+    if approval and can_run_ai_approval(template):
+        if automatic_audit_job(job) and not can_run_automatic_audit(approval, template):
+            return
         from .manual_review import full_review
         if full_review(db, approval):
             return
@@ -49,11 +70,11 @@ def complete_ai_audit(approval: Approval, task_id: str) -> None:
         approval.ai_status = "COMPLETED"
 
 
-def settle_ai_audit(approval: Approval, task_id: str) -> None:
-    """跳过执行不产生新完成状态；有待重审标记则继续等待，否则还原已有有效结论的进度。"""
+def settle_ai_audit(approval: Approval, task_id: str, *, waiting_for_node: bool = False) -> None:
+    """跳过时恢复已有结论进度；等待节点的重审意图不等于已经排队，不展示虚假队列状态。"""
     if approval.ai_task_id != task_id or approval.ai_status not in ACTIVE_AI_STATUSES:
         return
-    if approval.audit_requested:
+    if approval.audit_requested and not waiting_for_node:
         approval.ai_status = "QUEUED"
     elif (approval.last_audit_id and approval.decision != "PENDING"
           and approval.audit_attachment_version == approval.attachment_version):
@@ -66,7 +87,10 @@ def settle_job_ai_audit(db: Session, job_id: str) -> None:
     """收尾跳过审核的任务，也兼容升级前已绑定进度的回调或归档任务。"""
     for approval in db.scalars(select(Approval).where(
             Approval.ai_task_id == job_id, Approval.ai_status.in_(ACTIVE_AI_STATUSES))):
-        settle_ai_audit(approval, job_id)
+        job = db.get(Job, job_id)
+        template = db.get(ApprovalTemplate, approval.template_code)
+        waiting = bool(job and automatic_audit_job(job) and not can_run_automatic_audit(approval, template))
+        settle_ai_audit(approval, job_id, waiting_for_node=waiting)
 
 
 def update_job_ai_audit(db: Session, job_ids: list[str], status: str) -> None:

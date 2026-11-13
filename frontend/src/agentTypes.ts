@@ -5,7 +5,7 @@ export interface AgentContext {
   route: string;
   company_id: string;
   approval_id: string;
-  selection_type: "" | "approvals" | "invoices" | "archives" | "archived_approvals";
+  selection_type: "" | "approvals" | "invoices" | "archives" | "archived_approvals" | "budgets";
   selected_ids: string[];
   filters: Record<string, string>;
 }

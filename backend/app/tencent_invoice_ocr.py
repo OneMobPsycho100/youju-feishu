@@ -32,6 +32,8 @@ REQUEST_ID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", re.I)
 FIELD_NAMES = {
     "发票号码": "number", "发票代码": "code", "购买方名称": "buyer_name", "购买方识别号": "buyer_tax_id",
     "销售方名称": "seller_name", "开票日期": "issue_date", "小写金额": "amount", "价税合计(小写)": "amount",
+    "购买方统一社会信用代码/纳税人识别号": "buyer_tax_id", "购买方纳税人识别号": "buyer_tax_id",
+    "购买方税号": "buyer_tax_id", "购方识别号": "buyer_tax_id",
 }
 DISPLAY_FIELDS = {"发票名称", "发票类型", "合计金额", "合计税额"}
 TIMEOUT_ERROR = "腾讯云发票 OCR 请求超时，请稍后重试"
@@ -78,7 +80,7 @@ def _read_fields(entries: list, page: dict) -> dict[str, set[str]]:
     for item in entries:
         if not isinstance(item, dict) or not isinstance(item.get("Name"), str) or not isinstance(item.get("Value"), str):
             continue
-        label = unicodedata.normalize("NFKC", item["Name"]).strip()
+        label = re.sub(r"\s+", "", unicodedata.normalize("NFKC", item["Name"]))
         field = FIELD_NAMES.get(label)
         if not field and label not in DISPLAY_FIELDS:
             continue
@@ -89,6 +91,22 @@ def _read_fields(entries: list, page: dict) -> dict[str, set[str]]:
         if field and (candidate := normalized_candidate(field, value)):
             fields[field].add(candidate)
     return dict(fields)
+
+
+def _tax_items(items: object) -> list[dict[str, str]]:
+    """仅保留展示计算需要的结构化金额和税率，保留整组以便与票面合计核对。"""
+    if not isinstance(items, list):
+        return []
+    fields = {"untaxed_amount": "AmountWithoutTax", "tax_amount": "TaxAmount", "tax_rate": "TaxRate"}
+    result = []
+    for item in items:
+        if not isinstance(item, dict):
+            return []
+        values = {field: item.get(name) for field, name in fields.items()}
+        if any(not isinstance(value, str) or len(value) > 64 for value in values.values()):
+            return []
+        result.append({field: unicodedata.normalize("NFKC", value).strip() for field, value in values.items()})
+    return result
 
 
 async def _read_page(client: CommonClient, image: InvoiceImage, page: dict, timeout: float) -> tuple[dict[str, set[str]], str]:
@@ -103,6 +121,7 @@ async def _read_page(client: CommonClient, image: InvoiceImage, page: dict, time
         entries = response["VatInvoiceInfos"]
         if entries is not None and not isinstance(entries, list):
             return {}, RESPONSE_ERROR
+        page["tax_items"] = _tax_items(response.get("Items"))
         return _read_fields(entries or [], page), ""
     except TencentCloudSDKException as exc:
         page["request_id"] = _safe_request_id(exc.get_request_id())
@@ -157,6 +176,7 @@ def _merge_pages(pages: list[dict], candidates: list[dict[str, set[str]]]) -> di
     agreed = {field: next(iter(choices)) for field, choices in values.items() if len(choices) == 1}
     raw_text = "\n".join(line["text"] for page, _ in populated for line in page["lines"])
     return {"status": "COMPLETED" if agreed else "EMPTY", "fields": agreed, "raw_text": raw_text[:30000],
+            "tax_item_groups": [page["tax_items"] for page, _ in populated if page.get("tax_items")],
             "error": "" if agreed else EMPTY_ERROR}
 
 
@@ -175,6 +195,8 @@ def recognize_invoice_pages(images: list[InvoiceImage], secret_id: str, secret_k
     if error and not result.get("rejected"):
         # 任一页调用失败时整路不计票，避免把前几页误当成完整附件。
         result = {"status": "FAILED", "fields": {}, "error": error}
+    for page in pages:
+        page.pop("tax_items", None)
     return {**result, "pages": pages, "elapsed_ms": round((time.monotonic() - started) * 1000)}
 
 

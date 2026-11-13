@@ -1,5 +1,9 @@
 """模板识别和实际回写共用的飞书待办匹配。"""
 from collections.abc import Collection
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .models import Approval, ApprovalTemplate
 
 
 def matches_pre_review_node(task: dict, node_ids: Collection[str]) -> bool:
@@ -28,3 +32,22 @@ def select_pre_review_task(tasks: list[dict], node_ids: list[str], reviewer_open
         return {}, "MISSING"
     latest = matched[-1]
     return latest, latest.get("status") or "MISSING"
+
+
+def has_pending_pre_review_task(approval: "Approval | None", template: "ApprovalTemplate | None") -> bool:
+    """判断同步后是否持有唯一专用待办，不包含 AI 开关或付款处理策略。
+
+    审批的待办字段由 select_pre_review_task 写入，已经校验节点范围及唯一性。
+    不再用 node_id 直接比较配置，以兼容配置 custom_node_id、实例返回原始 node_id 的情况。
+    """
+    return bool(approval and template and template.active and template.node_ids and template.reviewer_open_id
+                and approval.status == "PENDING" and approval.task_status == "PENDING" and approval.task_id
+                and approval.assignee == template.reviewer_open_id)
+
+
+def has_completed_pre_review_task(tasks: list[dict], node_ids: list[str], reviewer_open_id: str) -> bool:
+    """从权威实例快照确认专用审批人已到过节点，仅用于恢复付款采集资格。"""
+    return bool(reviewer_open_id and any(
+        task.get("id") and task.get("status") in {"APPROVED", "DONE"}
+        and matches_pre_review_node(task, node_ids) and task_open_id(task) == reviewer_open_id
+        for task in tasks))

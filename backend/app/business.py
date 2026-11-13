@@ -6,6 +6,7 @@ import copy
 
 from fastapi import HTTPException
 from sqlalchemy import String, and_, cast, func, or_, select
+from sqlalchemy.orm import load_only
 
 from . import schemas as s
 from .config import settings
@@ -14,8 +15,8 @@ from .feishu_form import reimbursement_form
 from .integrations import DomainError
 from .invoice_display import invoice_display
 from .jobs import enqueue
-from .ai_status import can_run_ai_approval, queue_ai_audit
-from .models import ActivityLog, Approval, ApprovalAction, ApprovalTemplate, ArchiveRecord, Attachment, AuditRun, Company, Invoice, InvoiceClaim, Job, User, now
+from .ai_status import can_run_ai_approval, payment_collection_enabled, queue_ai_audit
+from .models import ActivityLog, Approval, ApprovalAction, ApprovalTemplate, ArchiveRecord, Attachment, AuditRun, Company, Invoice, InvoiceClaim, InvoiceDeductionConfig, Job, User, now
 from .parser import normalize
 from .services import audit_conclusion, audit_config_matches, feishu_link, log, request_action
 from .audit_policy import apply_evidence_review, reviewable
@@ -64,7 +65,8 @@ def approval_rows_dump(db, rows: list[Approval], *, attachments=None) -> list[di
     companies = {company.id: company for company in db.scalars(select(Company).where(Company.id.in_(company_ids)))} if company_ids else {}
     template_codes = {row.template_code for row in rows}
     templates = {row.code: row for row in db.execute(select(
-        ApprovalTemplate.code, ApprovalTemplate.field_mapping, ApprovalTemplate.ai_approval_enabled).where(
+        ApprovalTemplate.code, ApprovalTemplate.field_mapping, ApprovalTemplate.ai_approval_enabled,
+        ApprovalTemplate.business_type, ApprovalTemplate.payment_auto_approve_enabled).where(
             ApprovalTemplate.code.in_(template_codes)))}
     unmatched = {row.id: [] for row in rows}
     if attachments is None:
@@ -83,11 +85,23 @@ def approval_rows_dump(db, rows: list[Approval], *, attachments=None) -> list[di
     audits = {audit.id: audit for audit in db.scalars(select(AuditRun).where(
         AuditRun.id.in_([row.last_audit_id for row in rows if row.last_audit_id])))}
     files_by_approval = defaultdict(list)
+    collection_jobs = {job.id: job for job in db.scalars(select(Job).where(Job.id.in_(
+        [row.payment_collection_task_id for row in rows if row.payment_collection_task_id])))}
+    collection_statuses = {"PENDING": "QUEUED", "RUNNING": "RUNNING", "SUCCEEDED": "COMPLETED", "FAILED": "FAILED"}
+    payment_actions = {action.approval_id: action for action in db.scalars(select(ApprovalAction).where(
+        ApprovalAction.approval_id.in_(list(by_id)), ApprovalAction.execution_source == "PAYMENT_AUTO_APPROVE"
+    ).order_by(ApprovalAction.created_at)) if action.task_id == by_id[action.approval_id].task_id}
     for attachment in attachments:
         files_by_approval[attachment.approval_id].append(attachment)
     # 申报名称和未匹配的票面名称作为独立展示字段，不能据此自动确认主体或放行审批。
     return [{**s.ApprovalOut.model_validate(row).model_dump(mode="json"),
-             "ai_approval_enabled": templates[row.template_code].ai_approval_enabled,
+             "ai_approval_enabled": templates[row.template_code].ai_approval_enabled and not payment_collection_enabled(templates[row.template_code]),
+             "payment_auto_approve_enabled": payment_collection_enabled(templates[row.template_code]),
+             "payment_collection_status": collection_statuses.get(collection_jobs[row.payment_collection_task_id].status, "NOT_STARTED")
+                 if row.payment_collection_task_id in collection_jobs else "NOT_STARTED",
+             "payment_collection_issues": (collection_jobs[row.payment_collection_task_id].result or {}).get("issues", [])
+                 if row.payment_collection_task_id in collection_jobs else [],
+             "payment_auto_approval_status": payment_actions[row.id].status if row.id in payment_actions else "NOT_STARTED",
              "manual_review_valid": bool(full_review(db, row, audit=audits.get(row.last_audit_id),
                                                       attachments=files_by_approval[row.id])),
              "applicant": applicant_names.get(row.id) or row.applicant,
@@ -100,6 +114,9 @@ def overview(db, company_id: str = ""):
     if company_id:
         approvals = [a for a in approvals if company_id in a.company_ids]
     pending = [a for a in approvals if a.status == "PENDING" and a.task_status == "PENDING"]
+    collecting_templates = set(db.scalars(select(ApprovalTemplate.code).where(
+        ApprovalTemplate.business_type == "PAYMENT", ApprovalTemplate.payment_auto_approve_enabled.is_(True))))
+    review_pending = [a for a in pending if a.template_code not in collecting_templates]
     ids = [a.id for a in approvals]
     invoices = list(db.scalars(select(Invoice).where(Invoice.company_id == company_id))) if company_id else list(db.scalars(select(Invoice)))
     records = list(db.scalars(select(ArchiveRecord).where(ArchiveRecord.approval_id.in_(ids))))
@@ -111,7 +128,7 @@ def overview(db, company_id: str = ""):
         trend.append({"date": day.isoformat(), "amount": str(sum((a.amount for a in daily), Decimal("0"))), "count": len(daily)})
     risks = {}
     ai_templates = set(db.scalars(select(ApprovalTemplate.code).where(ApprovalTemplate.ai_approval_enabled.is_(True))))
-    for item in pending:
+    for item in review_pending:
         if item.template_code not in ai_templates:
             continue
         audit = db.get(AuditRun, item.last_audit_id) if item.last_audit_id else None
@@ -121,8 +138,8 @@ def overview(db, company_id: str = ""):
     failed_jobs = db.scalar(select(func.count()).select_from(Job).where(Job.status == "FAILED"))
     queue = db.scalar(select(func.count()).select_from(Job).where(Job.status.in_(["PENDING", "RUNNING"])))
     return {"approval_amount": str(sum((a.amount for a in approvals), Decimal("0"))), "approval_count": len(approvals),
-        "pending_count": len(pending), "review_count": sum(a.decision in {"REVIEW", "BLOCK"} for a in pending),
-        "pass_count": sum(a.decision == "PASS" for a in pending), "block_count": sum(a.decision == "BLOCK" for a in pending),
+        "pending_count": len(pending), "review_count": sum(a.decision in {"REVIEW", "BLOCK"} for a in review_pending),
+        "pass_count": sum(a.decision == "PASS" for a in review_pending), "block_count": sum(a.decision == "BLOCK" for a in review_pending),
         "invoice_count": len(invoices), "archived_count": sum(r.status == "ARCHIVED" for r in records),
         "quarantined_count": sum(r.status == "QUARANTINED" for r in records), "failed_jobs": failed_jobs, "queue_count": queue,
         "trend": trend, "risks": [{"name": key, "count": value} for key, value in sorted(risks.items(), key=lambda x: -x[1])],
@@ -142,7 +159,12 @@ def list_approvals(db, q="", decision="", status="", company_id="", page=1, page
             _local_applicant_name().contains(q),
         ))
     if decision:
-        statement = statement.where(Approval.decision == decision)
+        collecting = select(ApprovalTemplate.code).where(ApprovalTemplate.business_type == "PAYMENT",
+            ApprovalTemplate.payment_auto_approve_enabled.is_(True))
+        if decision == "COLLECT":
+            statement = statement.where(Approval.template_code.in_(collecting))
+        else:
+            statement = statement.where(Approval.decision == decision, Approval.template_code.not_in(collecting))
     if status:
         statement = statement.where(Approval.status == status)
     if business_type:
@@ -154,9 +176,16 @@ def list_approvals(db, q="", decision="", status="", company_id="", page=1, page
     return {"items": approval_rows_dump(db, rows), "total": total, "page": page, "page_size": page_size}
 
 
-def _invoice_out(invoice: Invoice, attachments: list[Attachment], expense_type: str | None) -> s.InvoiceOut:
+def _invoice_out(invoice: Invoice, attachments: list[Attachment], approval: Approval | None,
+                 rules: list[dict] | None) -> s.InvoiceOut:
+    """按当前审批的费用类型及归属主体选取规则，保留台账原有的消费类型来源。"""
+    expense_type = (approval.expense_type or "").strip() if approval else ""
+    modes = {}
+    if approval and expense_type and invoice.company_id in (approval.company_ids or []):
+        modes = {rule["billing_type"]: rule["mode"] for rule in (rules or []) if rule["expense_type"] == expense_type}
+    display_expense_type = expense_type if approval and approval.business_type == "REIMBURSEMENT" else None
     return s.InvoiceOut.model_validate(invoice).model_copy(
-        update={"display_details": invoice_display(invoice, attachments, expense_type)})
+        update={"display_details": invoice_display(invoice, attachments, display_expense_type, deduction_modes=modes)})
 
 
 def _sum_invoice_amounts(values: list[Decimal | None]) -> Decimal | None:
@@ -177,14 +206,25 @@ def approval_detail(db, approval_id: str, *, include_feishu_form: bool = False):
             invoice_attachments[attachment.invoice_id].append(attachment)
     invoice_rows = {invoice.id: invoice for invoice in db.scalars(select(Invoice).where(
         Invoice.id.in_(list(invoice_attachments))))} if invoice_attachments else {}
+    company_ids = {invoice.company_id for invoice in invoice_rows.values() if invoice.company_id}
+    deduction_rules = {
+        (company_id, tax_id): rules for company_id, tax_id, rules in db.execute(
+            select(Company.id, Company.tax_id, InvoiceDeductionConfig.rules)
+            .join(InvoiceDeductionConfig, InvoiceDeductionConfig.company_id == Company.id)
+            .where(Company.id.in_(company_ids), Company.active.is_(True)))
+    } if company_ids else {}
     reimbursement = approval.business_type == "REIMBURSEMENT"
-    expense_type = approval.expense_type if reimbursement else None
-    invoices = [_invoice_out(invoice_rows[key], files, expense_type)
-                for key, files in invoice_attachments.items() if key in invoice_rows]
+    invoices = []
+    for invoice_id, files in invoice_attachments.items():
+        invoice = invoice_rows.get(invoice_id)
+        if invoice:
+            invoices.append(_invoice_out(invoice, files, approval,
+                deduction_rules.get((invoice.company_id, invoice.buyer_tax_id))))
     invoice_totals = s.InvoiceTotalsOut(
         amount=sum((invoice.amount for invoice in invoices), Decimal(0)),
         tax_amount=_sum_invoice_amounts([invoice.display_details.tax_amount for invoice in invoices]),
         untaxed_amount=_sum_invoice_amounts([invoice.display_details.untaxed_amount for invoice in invoices]),
+        deductible_tax_amount=_sum_invoice_amounts([invoice.display_details.deductible_tax_amount for invoice in invoices]),
     ) if reimbursement and invoices else None
     audit = db.get(AuditRun, approval.last_audit_id) if approval.last_audit_id else None
     unresolved = [item for item in audit.evidence if not item["passed"] and item["severity"] in {"REVIEW", "BLOCK"}] if audit else []
@@ -203,6 +243,8 @@ def approval_detail(db, approval_id: str, *, include_feishu_form: bool = False):
     if include_feishu_form and reimbursement and approval.raw_form:
         template = db.get(ApprovalTemplate, approval.template_code)
         result["feishu_form"] = reimbursement_form(approval.raw_form, (template.field_mapping or {}) if template else {})
+    from .budgets import approval_context
+    result["budget_context"] = approval_context(db, approval)
     return result
 
 
@@ -244,6 +286,8 @@ def review_approval(db, approval_id: str, data: s.ManualReviewInput, user):
     """整单复核优先于全部审核规则；旧客户端的逐项确认继续维持原有行为。"""
     begin_write(db)
     approval = db.get(Approval, approval_id)
+    if approval and payment_collection_enabled(db.get(ApprovalTemplate, approval.template_code)):
+        raise DomainError("付款仅采集模式不执行规则复核，系统将自动同意专用节点")
     if not approval:
         raise HTTPException(404, "审批单不存在")
     if approval.version != data.expected_version or (data.audit_id is not None and approval.last_audit_id != data.audit_id):
@@ -313,9 +357,10 @@ def correct_attachment(db, approval_id: str, attachment_id: str, data: s.Correct
     except ValueError as exc:
         raise DomainError(str(exc)) from exc
     attachment.parsed_data = {**attachment.parsed_data, "fields": fields, "error": "", "confirmed": True,
+        "material_type": "INVOICE", "parse_status": "PARSED", "skip_reason": "",
         "confirmed_by": user.name, "confirmed_at": now().isoformat()+"Z", "confirmation_comment": data.comment}
     template = db.get(ApprovalTemplate, approval.template_code)
-    if not template.ai_approval_enabled and attachment.invoice_id:
+    if not can_run_ai_approval(template) and attachment.invoice_id:
         invoice = db.get(Invoice, attachment.invoice_id)
         if invoice.invoice_key != fields["invoice_key"]:
             # 人工更正票号后不能让原件继续指向旧票据；同步按剩余原件核对旧占用。
@@ -323,7 +368,7 @@ def correct_attachment(db, approval_id: str, attachment_id: str, data: s.Correct
     approval.decision, approval.audit_attachment_version = "PENDING", ""
     approval.version += 1
     log(db, user.name, "确认票面字段", approval.serial_number, {"attachment_id": attachment_id, "comment": data.comment, "fields": fields})
-    if template.ai_approval_enabled:
+    if can_run_ai_approval(template):
         job = enqueue(db, "AUDIT", {"instance_code": approval_id, "only_if_needed": True})
     else:
         job = enqueue(db, "REFRESH", {"instance_code": approval_id})
@@ -354,12 +399,18 @@ def invoices(db, q="", company_id="", page=1, page_size=20):
 
 def invoice_entry(db, row):
     """台账与选中发票查询共用占用及原件投影，不能只返回票面而漏掉重复来源。"""
-    claim, expense_type = db.execute(select(InvoiceClaim, Approval.expense_type).select_from(InvoiceClaim).outerjoin(Approval, and_(
-        Approval.id == InvoiceClaim.approval_id, Approval.business_type == "REIMBURSEMENT"))
-        .where(InvoiceClaim.active_key == row.id)).one_or_none() or (None, None)
+    claim, approval, rules = db.execute(
+        select(InvoiceClaim, Approval, InvoiceDeductionConfig.rules)
+        .select_from(InvoiceClaim)
+        .outerjoin(Approval, Approval.id == InvoiceClaim.approval_id)
+        .outerjoin(Company, and_(Company.id == row.company_id, Company.tax_id == row.buyer_tax_id, Company.active.is_(True)))
+        .outerjoin(InvoiceDeductionConfig, InvoiceDeductionConfig.company_id == Company.id)
+        .where(InvoiceClaim.active_key == row.id)
+        .options(load_only(Approval.expense_type, Approval.business_type, Approval.company_ids))
+    ).one_or_none() or (None, None, None)
     attachments = list(db.scalars(select(Attachment).where(Attachment.invoice_id == row.id, Attachment.active.is_(True))
                                  .order_by(Attachment.created_at, Attachment.id)))
-    return {**_invoice_out(row, attachments, expense_type).model_dump(mode="json"),
+    return {**_invoice_out(row, attachments, approval, rules).model_dump(mode="json"),
             "claim": s.ClaimOut.model_validate(claim).model_dump(mode="json") if claim else None,
             "attachment_id": attachments[0].id if attachments else None}
 

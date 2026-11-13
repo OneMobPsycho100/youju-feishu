@@ -15,25 +15,31 @@ interface DisplayField {
   width: number;
   value: (invoice: Invoice) => string | null | undefined;
   align?: "right";
+  format?: "amount" | "rate";
+  pending?: boolean;
   totalKey?: keyof InvoiceTotals;
 }
 
-// 审批和台账共用字段顺序及金额口径。没有来源的报销与抵扣字段统一显示占位。
+// 审批和台账共用字段顺序、格式及待确认语义，金额汇总复用后端的按票去重结果。
 const fields: DisplayField[] = [
   { key: "billing_type", label: "账单类型", width: 195,
     value: (row) => row.display_details?.billing_type || (row.kind === "E_INVOICE" ? "数电发票" : "传统发票") },
   { key: "expense_type", label: "消费类型", width: 115, value: (row) => row.display_details?.expense_type },
-  { key: "amount", label: "价税合计", width: 125, value: (row) => row.amount, align: "right", totalKey: "amount" },
-  { key: "tax_amount", label: "税额", width: 100, value: (row) => row.display_details?.tax_amount, align: "right", totalKey: "tax_amount" },
-  { key: "untaxed_amount", label: "不含税金额", width: 125, value: (row) => row.display_details?.untaxed_amount, align: "right", totalKey: "untaxed_amount" },
-  { key: "reimbursable_amount", label: "可报销金额", width: 125, value: () => null, align: "right" },
-  { key: "deductible_tax_rate", label: "可抵扣税率（%）", width: 145, value: () => null, align: "right" },
-  { key: "deductible_tax_amount", label: "可抵扣税额", width: 125, value: () => null, align: "right" },
+  { key: "amount", label: "价税合计", width: 125, value: (row) => row.amount, align: "right", format: "amount", totalKey: "amount" },
+  { key: "tax_amount", label: "税额", width: 100, value: (row) => row.display_details?.tax_amount, align: "right", format: "amount", totalKey: "tax_amount" },
+  { key: "untaxed_amount", label: "不含税金额", width: 125, value: (row) => row.display_details?.untaxed_amount, align: "right", format: "amount", totalKey: "untaxed_amount" },
+  { key: "reimbursable_amount", label: "可报销金额", width: 125, value: (row) => row.display_details?.reimbursable_amount ?? row.amount,
+    align: "right", format: "amount", totalKey: "amount" },
+  { key: "deductible_tax_rate", label: "可抵扣税率（%）", width: 145, value: (row) => row.display_details?.deductible_tax_rate,
+    align: "right", format: "rate", pending: true },
+  { key: "deductible_tax_amount", label: "可抵扣税额", width: 125, value: (row) => row.display_details?.deductible_tax_amount,
+    align: "right", format: "amount", pending: true, totalKey: "deductible_tax_amount" },
 ];
 
-function displayValue(field: DisplayField, invoice: Invoice): string {
-  const value = field.value(invoice);
-  return field.totalKey ? invoiceAmount(value) : value || "—";
+function displayValue(field: DisplayField, value: string | null | undefined): string {
+  if (value == null || value === "") return field.pending ? "待确认" : "—";
+  if (field.format === "amount") return invoiceAmount(value);
+  return field.format === "rate" ? `${value}%` : value;
 }
 
 export const invoiceDisplayColumns: TableColumnsType<Invoice> = fields.map((field) => ({
@@ -41,13 +47,13 @@ export const invoiceDisplayColumns: TableColumnsType<Invoice> = fields.map((fiel
   title: field.label,
   width: field.width,
   align: field.align,
-  render: (_, invoice) => field.totalKey
-    ? <span className="amount-text">{displayValue(field, invoice)}</span>
-    : displayValue(field, invoice),
+  render: (_, invoice) => field.format === "amount"
+    ? <span className="amount-text">{displayValue(field, field.value(invoice))}</span>
+    : displayValue(field, field.value(invoice)),
 }));
 
 export function invoiceDisplayItems(invoice: Invoice) {
-  return fields.map((field) => ({ key: field.key, label: field.label, children: displayValue(field, invoice) }));
+  return fields.map((field) => ({ key: field.key, label: field.label, children: displayValue(field, field.value(invoice)) }));
 }
 
 export function ApprovalInvoiceTable({ invoices, totals, onView }: {
@@ -82,7 +88,7 @@ export function ApprovalInvoiceTable({ invoices, totals, onView }: {
             <Table.Summary.Cell index={0} colSpan={identityColumns.length}><strong>合计</strong></Table.Summary.Cell>
             {fields.map((field, index) => (
               <Table.Summary.Cell key={field.key} index={identityColumns.length + index} align={field.align}>
-                {field.totalKey ? <strong>{invoiceAmount(totals[field.totalKey])}</strong> : field.align && "—"}
+                {field.totalKey ? <strong>{displayValue(field, totals[field.totalKey])}</strong> : field.align && "—"}
               </Table.Summary.Cell>
             ))}
             <Table.Summary.Cell index={identityColumns.length + fields.length} />

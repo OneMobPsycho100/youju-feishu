@@ -6,11 +6,14 @@ from sqlalchemy import and_, func, or_, select, update
 
 from .config import settings
 from .db import begin_write
+from .errors import StaleSnapshotError
 from .integrations import DomainError, FeishuGateway, gateway
 from .models import Approval, Job, User
 
 
 _UNKNOWN_APPLICANT = "未知申请人"
+PAYMENT_APPROVAL_TIME_JOB = "PAYMENT_APPROVAL_TIME"
+_PAYMENT_APPROVAL_TIME_KEY = "payment-approval-time:"
 
 
 def feishu_time(value) -> datetime | None:
@@ -21,6 +24,15 @@ def feishu_time(value) -> datetime | None:
     except (ValueError, OverflowError):
         pass
     return None
+
+
+def approved_at_from_snapshot(snapshot: dict) -> datetime | None:
+    """只接受最终通过实例的结束时间。撤销快照的结束时间可能属于撤销动作。"""
+    if snapshot.get("status") != "APPROVED" or snapshot.get("reverted") is True:
+        return None
+    end = feishu_time(snapshot.get("end_time"))
+    start = feishu_time(snapshot.get("start_time"))
+    return end if end and (not start or end >= start) else None
 
 
 def snapshot_metadata(snapshot: dict) -> dict:
@@ -89,9 +101,44 @@ def backfill_metadata(db, instance_code: str) -> dict:
         # 保留原更新时间和审核版本；元数据补齐不会令进行中的审批操作过期。
         db.execute(update(Approval).where(Approval.id == instance_code).values(**missing, updated_at=Approval.updated_at))
     complete = (approval.submitted_at is not None or "submitted_at" in missing) and bool(approval.applicant_id or missing.get("applicant_id"))
+    from .budgets import refresh_usage
+    db.expire(approval)
+    refresh_usage(db, approval)
     db.commit()
     if not complete:
         raise DomainError("飞书实例未返回有效提交时间或报销人身份；已保留取得的字段，请在后台任务中重试")
+    return {"approval_id": instance_code, "completed": True}
+
+
+def _needs_payment_approval_time(approval: Approval | None) -> bool:
+    return approval is not None and approval.business_type == "PAYMENT" and approval.status == "APPROVED" and approval.approved_at is None
+
+
+def backfill_payment_approval_time(db, instance_code: str) -> dict:
+    """从飞书补齐历史付款通过时间，在短写事务中核对实例仍为同一版最终状态。"""
+    approval = db.get(Approval, instance_code)
+    if not _needs_payment_approval_time(approval):
+        return {"skipped": True}
+    identity = approval.template_code, approval.last_synced_at
+    db.rollback()
+    snapshot = gateway(db).get_instance(instance_code)
+
+    begin_write(db)
+    approval = db.get(Approval, instance_code)
+    if not _needs_payment_approval_time(approval):
+        db.rollback()
+        return {"skipped": True}
+    # 同步或归档可以先补齐时间，仍缺时间时只允许未被更新的实例写入本次读取结果。
+    if (approval.template_code, approval.last_synced_at) != identity:
+        raise StaleSnapshotError("付款审批同步版本已更新，稍后重新读取最终通过时间")
+    if snapshot.get("approval_code") and snapshot["approval_code"] != approval.template_code:
+        raise DomainError("飞书返回的审批模板与付款申请不一致")
+    approved_at = approved_at_from_snapshot(snapshot)
+    if approved_at is None:
+        raise DomainError("飞书实例暂无有效最终通过时间，请核对审批状态后重试")
+    db.execute(update(Approval).where(Approval.id == instance_code).values(
+        approved_at=approved_at, updated_at=Approval.updated_at))
+    db.commit()
     return {"approval_id": instance_code, "completed": True}
 
 
@@ -155,6 +202,11 @@ def schedule_metadata(db, enqueue) -> None:
         ~scheduled).order_by(Approval.created_at, Approval.id).limit(20)).all()
     for instance_code in rows:
         enqueue(db, "REIMBURSEMENT_METADATA", {"instance_code": instance_code}, f"reimbursement-metadata:{instance_code}")
+    scheduled = select(Job.id).where(Job.dedupe_key == _PAYMENT_APPROVAL_TIME_KEY + Approval.id).exists()
+    rows = db.scalars(select(Approval.id).where(Approval.business_type == "PAYMENT", Approval.status == "APPROVED",
+        Approval.approved_at.is_(None), ~scheduled).order_by(Approval.created_at, Approval.id).limit(20)).all()
+    for instance_code in rows:
+        enqueue(db, PAYMENT_APPROVAL_TIME_JOB, {"instance_code": instance_code}, _PAYMENT_APPROVAL_TIME_KEY + instance_code)
     if settings().app_mode == "live":
         key = "approval-applicant-name:" + Approval.id
         scheduled = select(Job.id).where(Job.dedupe_key == key).exists()

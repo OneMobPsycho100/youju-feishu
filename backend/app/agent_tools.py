@@ -10,6 +10,7 @@ from . import agent_schemas as a, business, schemas as s
 from .agent_store import clean, emit, owned, proposal_dump
 from .config import settings
 from .db import begin_write
+from .ai_status import payment_collection_enabled
 from .integrations import DomainError
 from .model_config import current_audit_fingerprint
 from .models import (AgentProposal, Approval, ApprovalAction, ApprovalTemplate, ArchiveRecord,
@@ -50,6 +51,30 @@ def read_business(db, data: a.QueryInput, context: dict):
             inherited.pop("approval_month", None)
         data = a.QueryInput.model_validate({**data.model_dump(), **inherited})
     company_id = company_scope(db, data.company_id, context)
+    if data.entity in {"budgets", "budget", "budget_usages"}:
+        from . import budget_schemas as bs, budgets
+        if data.entity == "budgets":
+            result = budgets.list_budgets(db, company_id=company_id, department=data.department, expense_type=data.expense_type,
+                period_type=data.period_type, period_scope=data.period_scope, budget_status=data.budget_status,
+                archived=data.archived, start_date=data.start_date, end_date=data.end_date, q=data.q, page=data.page, page_size=data.page_size)
+            return {"entity": "budgets", "scope": company_id, **bs.BudgetList.model_validate(result).model_dump(mode="json")}
+        selected = context.get("selected_ids", []) if context.get("selection_type") == "budgets" else []
+        target = data.target_id or (selected[0] if len(selected) == 1 else "")
+        if not target:
+            raise DomainError("请先指定预算ID，或打开一项预算")
+        budget = budgets.get_budget(db, target)
+        if company_id and budget.company_id != company_id:
+            raise DomainError("预算不在当前公司主体范围内，请重新选择公司")
+        if data.entity == "budget_usages":
+            result = budgets.usage_details(db, budget_id=target, state=data.usage_state, applicant_id=data.applicant_id,
+                expense_type=data.expense_type, page=data.page, page_size=data.page_size)
+            return {"entity": "budget_usages", **s.PageOut[bs.BudgetUsageOut].model_validate(result).model_dump(mode="json")}
+        result = bs.BudgetDetail.model_validate(budgets.budget_detail(db, target)).model_dump(mode="json", exclude={"trend"})
+        # 明细单独分页查询，助手单次返回前20个贡献分组，避免长周期分布撑满工具上下文。
+        for key in ("applicants", "expense_types"):
+            result[key + "_total"] = len(result[key])
+            result[key] = result[key][:20]
+        return {"entity": "budget", **result}
     if data.entity == "overview":
         result = business.overview(db, company_id)
         # 助手不需要读取全局操作者活动；金额及结论来自同一汇总入口。
@@ -150,6 +175,8 @@ def create_proposal(db, data: a.ProposalInput, handle):
         if not approval:
             raise DomainError("审批单不存在，请先查询真实记录")
         template = db.get(ApprovalTemplate, approval.template_code)
+        if data.kind in PRE_REVIEW_PROPOSALS and payment_collection_enabled(template):
+            raise DomainError("付款当前仅采集并自动同意专用节点，无需提出审核或人工回写方案")
         if data.kind in PRE_REVIEW_PROPOSALS and not template.ai_approval_enabled:
             raise DomainError("此模板由财务人工预审，请打开审批详情处理")
         checks = {"version": approval.version, "attachment_version": approval.attachment_version,
@@ -221,6 +248,8 @@ def confirm_proposal(db, proposal_id, user, original_checked=False):
             if not approval or approval.version != proposal.checks["version"] or approval.attachment_version != proposal.checks["attachment_version"]:
                 raise DomainError("审批或附件已经变化，请重新查询并生成方案")
             template = db.get(ApprovalTemplate, approval.template_code)
+            if proposal.kind in PRE_REVIEW_PROPOSALS and payment_collection_enabled(template):
+                raise DomainError("付款已切换为仅采集自动同意，旧审核方案已失效")
             if proposal.kind in PRE_REVIEW_PROPOSALS and not template.ai_approval_enabled:
                 raise DomainError("此模板由财务人工预审，请打开审批详情处理")
             from .manual_review import full_review

@@ -93,6 +93,13 @@ export const money = (amount: string | number | undefined) =>
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   });
+
+/** 直接格式化接口返回的十进制文本，保留大额金额中的分。 */
+export function formatDecimalAmount(value?: string) {
+  const [integer, fraction = "00"] = (value || "0.00").split(".");
+  return `${integer.replace(/\B(?=(\d{3})+(?!\d))/g, ",")}.${fraction.padEnd(2, "0")}`;
+}
+
 export function localTime(value?: string, short = false, includeYear = false) {
   if (!value) return "—";
   const date = new Date(/[Zz]|[+]\d\d:\d\d$/.test(value) ? value : value + "Z");

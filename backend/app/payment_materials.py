@@ -171,7 +171,49 @@ def _read_payment_pdf(path: Path, confirmed_kind: str) -> tuple[list[dict[str, s
 
 def read_payment_material(path: Path, config, *, sha256: str, approval_id: str, template_code: str,
                           parent_db, previous: dict | None = None, invoice_linked: bool = False,
-                          before_request: Callable[[], None] | None = None) -> dict:
+                          before_request: Callable[[], None] | None = None, ocr_config=None) -> dict:
+    """PDF、图片共用完整分类与票面入口；普通付款材料另保留正文及限页范围。"""
+    from .file_types import IMAGE_SUFFIXES, detect_file_type
+    from .invoice_recognition import recognition_cache_valid
+    from .ocr_config import load_ocr_config
+    from .parser import parse_with_fallback
+    suffix, _ = detect_file_type(path.read_bytes(), path.name)
+    if suffix not in {".pdf", *IMAGE_SUFFIXES}:
+        return _read_payment_material_body(path, config, sha256=sha256, approval_id=approval_id,
+            template_code=template_code, parent_db=parent_db, previous=previous,
+            invoice_linked=invoice_linked, before_request=before_request)
+    ocr = ocr_config or load_ocr_config(parent_db)
+    previous = previous or {}
+    parsed = copy.deepcopy(previous) if recognition_cache_valid(previous, sha256, config, ocr_version=ocr.recognition_version) else parse_with_fallback(
+        path, config, ocr_config=ocr, approval_id=approval_id, template_code=template_code, parent_db=parent_db,
+        sha256=sha256, previous=previous, before_request=before_request)
+    material = copy.deepcopy(previous.get("material") or {})
+    if parsed.get("material_type") == "INVOICE":
+        material.update(complete=True, segments=[], summary="原件已确认为发票，继续按票面字段处理", error="")
+        return {**parsed, "material": material}
+    if parsed.get("material_type") == "UNKNOWN":
+        # 长合同仍可展示已有前缀，但不把限页阅读当作整份分类完成。
+        if suffix == ".pdf":
+            body = _read_payment_material_body(path, config, sha256=sha256, approval_id=approval_id,
+                template_code=template_code, parent_db=parent_db, previous=previous,
+                invoice_linked=invoice_linked, before_request=before_request)
+            material.update(body.get("material") or {})
+        material.update(complete=False, error=parsed.get("error") or "材料类别尚未确认")
+        return {**parsed, "material": material}
+    body = _read_payment_material_body(path, config, sha256=sha256, approval_id=approval_id,
+        template_code=template_code, parent_db=parent_db, previous=previous,
+        invoice_linked=invoice_linked, before_request=before_request)
+    if suffix == ".pdf" and not body.get("material", {}).get("complete") and not body.get("material", {}).get("page_scope"):
+        # 扫描 PDF 的分类已完整读取页面，正文仍需按图像保留，不能把摘要当成完整正文。
+        body = _read_payment_material_body(path, config, sha256=sha256, approval_id=approval_id,
+            template_code=template_code, parent_db=parent_db, previous=previous,
+            invoice_linked=invoice_linked, before_request=before_request, prepared_images=invoice_images(path, suffix))
+    return {**body, **parsed, "material": body.get("material") or material}
+
+
+def _read_payment_material_body(path: Path, config, *, sha256: str, approval_id: str, template_code: str,
+                          parent_db, previous: dict | None = None, invoice_linked: bool = False,
+                          before_request: Callable[[], None] | None = None, prepared_images=None) -> dict:
     """PDF 仅本地读取与分类，缓存不依赖模型；其他材料保留原有模型读取路径。"""
     previous = previous or {}
     suffix = path.suffix.lower()
@@ -195,7 +237,7 @@ def read_payment_material(path: Path, config, *, sha256: str, approval_id: str, 
             result["material_type"] = "INVOICE"
             target.update(complete=True, summary="结构化票据，继续执行发票身份与交叉识别校验")
             return result
-        if suffix == ".pdf":
+        if suffix == ".pdf" and prepared_images is None:
             segments, kind, invoice_suspected, total_pages = _read_payment_pdf(path, confirmed_kind)
             result["material_type"] = kind
             target.update(segments=segments, invoice_suspected=invoice_suspected)
@@ -206,7 +248,7 @@ def read_payment_material(path: Path, config, *, sha256: str, approval_id: str, 
             else:
                 target.update(complete=True, summary="财务已确认材料类别，保留完整正文" if confirmation else "PDF 已在本地完整读取")
             return result
-        segments, images = _read_local(path)
+        segments, images = ([], prepared_images) if prepared_images is not None else _read_local(path)
         if not segments and not images:
             raise ValueError("材料正文为空，无法取得付款依据")
         text = "\n".join(item["text"] for item in segments)

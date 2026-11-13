@@ -5,7 +5,7 @@ const sourceLabels: Record<string, string> = {
   TEXT: "PDF 文字层", TENCENT_OCR: "腾讯云发票 OCR", OCR: "本地 OCR", MODEL: "多模态", XML: "结构化 XML", OFD: "OFD 文本",
 };
 
-/** 人工确认优先展示，区分 PDF 本地解析、模型兜底和图片交叉核对。 */
+/** 人工确认优先展示，分类、PDF 本地解析与图片 OCR 主识别分别说明。 */
 export function recognitionLabel(data: ParsedData): string {
   if (data.archive) {
     if (data.archive.status === "FAILED") return "压缩包 · 待核对";
@@ -13,12 +13,14 @@ export function recognitionLabel(data: ParsedData): string {
   }
   if (data.reference_pdf === "TRAVEL") return "网约车行程单 · 已读取";
   if (data.reference_pdf === "REVIEW") return "PDF 票面待核对";
-  if (data.parse_status === "SKIPPED") return "普通附件 · 已跳过发票解析";
+  if (data.confirmed) return "人工确认";
+  if (data.parse_status === "SKIPPED") return "普通附件 · 已分类";
+  if (data.classification && !data.classification.complete) return "附件类别待确认";
   if (data.material_type && data.material_type !== "INVOICE") {
     const names = { CONTRACT: "合同", QUOTE: "报价单", OTHER: "其他材料", UNKNOWN: "待确认材料" };
     return names[data.material_type] + (data.material?.complete ? " · 已读取" : " · 待核对");
   }
-  if (data.confirmed) return "人工确认";
+  if (data.recognition?.status === "OCR") return "发票 OCR 识别完成";
   if (data.recognition?.status === "LOCAL") return "PDF 本地解析完成";
   if (data.recognition?.status === "VERIFIED") return data.file_type === ".pdf" && data.sources?.MODEL
     ? "PDF 模型兜底完成" : "交叉核对通过";
@@ -28,8 +30,15 @@ export function recognitionLabel(data: ParsedData): string {
 
 export function InvoiceRecognition({ data }: { data: ParsedData }) {
   if (data.archive) return null;
-  if (data.parse_status === "SKIPPED") return <Typography.Paragraph type="secondary">{data.skip_reason}</Typography.Paragraph>;
-  if (!data.recognition) return null;
+  const classification = data.classification;
+  const classificationEvidence = classification && <div className="invoice-classification">
+    <strong>{classification.source === "MANUAL" ? "人工分类" : "模型内容分类"}{classification.cached ? " · 已复用" : ""}</strong>
+    <p>{classification.reason}</p>
+    {!!classification.pages.length && <small>已检查第 {classification.pages.join("、")} 页
+      {classification.invoice_pages.length > 0 && `；发票位于第 ${classification.invoice_pages.join("、")} 页`}
+      {`；不同发票 ${classification.invoice_count} 张`}</small>}
+  </div>;
+  if (data.parse_status === "SKIPPED" || !data.recognition) return classificationEvidence || <Typography.Paragraph type="secondary">{data.skip_reason}</Typography.Paragraph>;
   const sources = Object.entries(data.sources || {});
   return (
     <Collapse
@@ -39,6 +48,7 @@ export function InvoiceRecognition({ data }: { data: ParsedData }) {
         key: "recognition",
         label: <span>{recognitionLabel(data)} · 查看识别依据</span>,
         children: <>
+          {classificationEvidence}
           <p>{data.confirmed ? "已人工确认" : data.recognition.reason}</p>
           <div className="recognition-sources">
             {sources.map(([name, source]) => <div key={name}>

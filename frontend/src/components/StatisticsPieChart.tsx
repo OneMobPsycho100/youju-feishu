@@ -13,6 +13,8 @@ interface StatisticsPieChartProps {
   formatAmount: (value: string) => string;
   /** 扇区和图例共用既有的分组明细入口，传回完整真实分组。 */
   onSelect: (group: StatisticsGroup) => void;
+  /** 类别图使用环形展示；省略时保留原饼图行为。 */
+  donut?: boolean;
 }
 
 const colors = ["#4f83ef", "#4fb8a0", "#a389e3", "#f1b963", "#e98b8e", "#6dc1d5", "#8a9dd5", "#a2bf72", "#d494c2", "#d2ac8c"];
@@ -23,7 +25,7 @@ function point(angle: number) {
 }
 
 /** 嵌入共用金额分布区域的饼图内容；复用分组数据，标题和图表切换由页面统一管理。 */
-export function StatisticsPieChart({ groups, totalAmount, dimensionLabel, formatAmount, onSelect }: StatisticsPieChartProps) {
+export function StatisticsPieChart({ groups, totalAmount, dimensionLabel, formatAmount, onSelect, donut = false }: StatisticsPieChartProps) {
   const total = Number(totalAmount);
   const entries = groups.map((group, index) => ({ group, color: colors[index % colors.length] }));
   const positive = entries.filter(({ group }) => Number(group.amount) > 0);
@@ -36,9 +38,9 @@ export function StatisticsPieChart({ groups, totalAmount, dimensionLabel, format
     return { ...entry, path: `M 120 120 L ${point(start)} A 108 108 0 ${angle - start > 180 ? 1 : 0} 1 ${point(angle)} Z` };
   });
   return !groups.length || total <= 0 ? <Empty image={Empty.PRESENTED_IMAGE_SIMPLE}
-      description={groups.length ? "报销总额为0，暂无金额占比" : "当前筛选下暂无报销申请"} /> : <div className="statistics-pie-layout">
+      description={groups.length ? "当前总额为0，暂无金额占比" : "当前筛选下暂无可统计单据"} /> : <div className="statistics-pie-layout">
       <div className="statistics-pie-figure">
-        <svg viewBox="0 0 240 240" role="group" aria-label={`${dimensionLabel}金额占比饼图`} className="statistics-pie-chart">
+        <svg viewBox="0 0 240 240" role="group" aria-label={`${dimensionLabel}金额占比${donut ? "环形图" : "饼图"}`} className="statistics-pie-chart">
           {slices.map(({ group, color, path }) => {
             const label = `${group.name}：¥${formatAmount(group.amount)}，占比${group.percentage}%，查看审批明细`;
             const interaction = {
@@ -53,6 +55,8 @@ export function StatisticsPieChart({ groups, totalAmount, dimensionLabel, format
               {slices.length === 1 ? <circle cx={120} cy={120} r={108} {...interaction} /> : <path d={path} {...interaction} />}
             </Tooltip>;
           })}
+          {donut && <g className="statistics-donut-center"><circle cx={120} cy={120} r={66} fill="white" />
+            <text x={120} y={116} textAnchor="middle">{dimensionLabel}</text><text x={120} y={140} textAnchor="middle">{groups.length} 类</text></g>}
         </svg>
       </div>
       <div className="statistics-pie-legend" aria-label={`${dimensionLabel}金额占比图例`}>

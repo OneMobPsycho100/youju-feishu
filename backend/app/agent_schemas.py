@@ -14,7 +14,7 @@ class AgentContext(BaseModel):
     route: str = Field("overview", max_length=150, description="发送时所在的工作模块")
     company_id: str = Field("", max_length=32, description="公司筛选；空值表示全部主体")
     approval_id: str = Field("", max_length=64, description="当前打开的审批 ID")
-    selection_type: Literal["", "approvals", "invoices", "archives", "archived_approvals"] = Field("",
+    selection_type: Literal["", "approvals", "invoices", "archives", "archived_approvals", "budgets"] = Field("",
         description="选中记录类型；archived_approvals 的 ID 是审批实例，archives 是旧原件归档记录")
     selected_ids: list[str] = Field(default_factory=list, max_length=20, description="用户选中的记录，最多二十条")
     filters: dict[str, str] = Field(default_factory=dict, description="页面当前搜索、状态、月份及业务类型；仅接受已知筛选字段")
@@ -30,7 +30,8 @@ class AgentContext(BaseModel):
     @classmethod
     def valid_filters(cls, value):
         allowed = {"q", "decision", "status", "month", "approval_month", "business_type",
-                   "month_basis", "invoice_month", "scope", "archive_status"}
+                   "month_basis", "invoice_month", "scope", "archive_status", "department", "expense_type",
+                   "period_type", "period_scope", "budget_status", "archived", "start_date", "end_date"}
         if set(value) - allowed or any(len(item) > 200 for item in value.values()):
             raise ValueError("筛选字段不合法")
         return value
@@ -187,12 +188,12 @@ class UsageSummaryOut(BaseModel):
 class QueryInput(BaseModel):
     """白名单数据检索；不接受 SQL、接口地址或任意查询表达式。"""
     model_config = ConfigDict(extra="forbid")
-    entity: Literal["overview", "companies", "approvals", "approval", "invoices", "archives", "archived_approvals", "jobs", "job"] = Field(
-        description="查询对象；archived_approvals 按整单审批归档，archives 按旧归档原件")
-    target_id: str = Field("", max_length=100, description="查询单条审批或任务时必填；审批可省略以使用当前单据")
+    entity: Literal["overview", "companies", "approvals", "approval", "invoices", "archives", "archived_approvals", "jobs", "job", "budgets", "budget", "budget_usages"] = Field(
+        description="查询对象；budgets 预算台账，budget 单项预算和贡献，budget_usages 预算报销明细；archived_approvals 整单归档")
+    target_id: str = Field("", max_length=100, description="单条审批、任务或预算的真实ID；预算明细传预算ID，审批和预算可省略以引用当前打开记录")
     company_id: str | None = Field(None, max_length=32, description="省略继承本轮公司；明确空字符串查询全部主体")
     q: str = Field("", max_length=200, description="事由、编号、申请人或票号关键词")
-    decision: Literal["", "PENDING", "PASS", "REVIEW", "BLOCK"] = Field("", description="预审结论筛选")
+    decision: Literal["", "PENDING", "PASS", "REVIEW", "BLOCK", "COLLECT"] = Field("", description="预审结论筛选；COLLECT 查询付款仅采集，其他结论不含仅采集付款")
     status: str = Field("", max_length=30, description="审批、归档或后台任务状态")
     business_type: Literal["", "REIMBURSEMENT", "PAYMENT"] = Field("", description="审批业务类型；空值全部，REIMBURSEMENT 报销，PAYMENT 付款")
     month: str = Field("", max_length=7, description="归档开票月份 YYYY-MM")
@@ -205,6 +206,27 @@ class QueryInput(BaseModel):
     page: int = Field(1, ge=1, le=10000, description="页码；从一开始")
     page_size: int = Field(10, ge=1, le=20, description="返回条数，最多二十")
     ids: list[str] = Field(default_factory=list, max_length=20, description="按真实 ID 查询页面选中的审批、发票或归档")
+    department: str = Field("", max_length=100, description="预算的表单申请部门名称，精确匹配")
+    expense_type: str = Field("", max_length=80, description="预算费用类别，留空不限")
+    period_type: Literal["", "MONTH", "QUARTER", "YEAR", "CUSTOM"] = Field("", description="预算周期类型，留空不限")
+    period_scope: Literal["current", "all"] = Field("current", description="预算默认覆盖今天；历史和未来预算使用all")
+    budget_status: Literal["", "NORMAL", "WARNING", "EXHAUSTED", "EXCEEDED"] = Field("", description="预算使用状态，EXCEEDED为超预算")
+    archived: Literal["active", "archived", "all"] = Field("active", description="预算归档范围")
+    start_date: date | None = Field(None, description="预算相交周期筛选起始日期，北京时间")
+    end_date: date | None = Field(None, description="预算相交周期筛选结束日期，北京时间")
+    usage_state: Literal["", "RESERVED", "USED", "FROZEN", "RELEASED"] = Field("", description="预算明细占用状态")
+    applicant_id: str = Field("", max_length=220, description="预算人员贡献返回的稳定身份，用于明细下钻")
+
+    @field_validator("start_date", "end_date", mode="before")
+    @classmethod
+    def empty_budget_date(cls, value):
+        return None if value == "" else value
+
+    @model_validator(mode="after")
+    def valid_budget_dates(self):
+        if self.start_date and self.end_date and self.start_date > self.end_date:
+            raise ValueError("预算筛选开始日期不能晚于结束日期")
+        return self
 
 
 class CorrectionDraft(BaseModel):

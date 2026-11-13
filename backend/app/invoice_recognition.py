@@ -1,4 +1,4 @@
-"""发票识别策略：PDF 接受完整本地字段，图片按独立来源交叉核对。"""
+"""发票字段采用策略：PDF 本地优先，图片 OCR 优先，内容分类独立校验。"""
 import hashlib
 import hmac
 import json
@@ -14,6 +14,7 @@ PIPELINE_VERSION = "pdf-local-image-cross-check-v3"
 # 仅参与 PDF 缓存键，不改变图片识别策略或触发启动时的全量审核失效。
 PDF_TEXT_VERSION = "pdf-text-coordinates-model-fallback-v1"
 TENCENT_OCR = "TENCENT_OCR"
+DOCUMENT_RECOGNITION_VERSION = "visual-classification-ocr-primary-v1"
 FIELD_LABELS = {
     "number": "发票号码", "code": "发票代码", "buyer_name": "购买方名称",
     "buyer_tax_id": "购买方税号", "seller_name": "销售方名称",
@@ -145,9 +146,49 @@ def compare_sources(sources: dict, *, structured=False, local_pdf=False) -> dict
 
 def recognition_passed(result: dict) -> bool:
     """人工确认绑定当前附件；本地解析或交叉核对通过均须使用当前策略版本。"""
-    return bool(not result.get("error") and (result.get("confirmed") or
+    classification = result.get("classification") or {}
+    classified = (not result.get("document_policy_version") or
+        (classification.get("complete") and classification.get("material_type") == "INVOICE"
+         and classification.get("invoice_count") == 1))
+    return bool(not result.get("error") and (result.get("confirmed") or (classified and
         (result.get("pipeline_version") == PIPELINE_VERSION and
-         result.get("recognition", {}).get("status") in {"LOCAL", "VERIFIED", "STRUCTURED"})))
+         (result.get("recognition") or {}).get("status") in {"LOCAL", "VERIFIED", "STRUCTURED", "OCR"}))))
+
+
+def compare_image_sources(sources: dict) -> dict:
+    """完整 OCR 单独采用；仅在票号、适用代码和金额一致时允许模型补缺。
+
+    分类模型的误读不能推翻完整有效的 OCR；OCR 缺少关键身份时只保存候选，
+    不能把模型补出的整张票误记为已完成 OCR 核对。
+    """
+    ocr, model = sources.get(TENCENT_OCR, {}), sources.get("MODEL", {})
+    def value(source, field, *, clear=False):
+        if source.get("status") != "COMPLETED" or field in source.get("ambiguous_fields", []):
+            return ""
+        if clear and (source.get("clear_fields") or {}).get(field) is not True:
+            return ""
+        return normalized_candidate(field, (source.get("fields") or {}).get(field))
+    number = value(ocr, "number")
+    anchors = ["number", "amount", *(["code"] if len(number) == 8 else [])]
+    same_invoice = bool(number) and all(value(ocr, key) and value(ocr, key) == value(model, key, clear=True) for key in anchors)
+    fields, comparisons, missing = {}, [], []
+    for field, label in FIELD_LABELS.items():
+        local, fallback = value(ocr, field), value(model, field, clear=True)
+        required = field != "code" or len(number or value(model, "number", clear=True)) == 8
+        accepted, names = (local, [TENCENT_OCR]) if local else ((fallback, ["MODEL"]) if same_invoice and fallback else ("", []))
+        status = "AGREED" if accepted else "MISSING"
+        if not required:
+            accepted, names, status = "", [], "NOT_REQUIRED"
+        if required and not accepted:
+            missing.append(label)
+        fields[field] = accepted
+        comparisons.append({"field": field, "label": label, "required": required,
+            "values": {name: str((source.get("fields") or {}).get(field) or "") for name, source in sources.items()},
+            "accepted": accepted, "matched_sources": names, "status": status})
+    return {"status": "UNCERTAIN" if missing else "OCR", "fields": fields, "comparisons": comparisons,
+            "reason": "以下字段尚未可靠识别：" + "、".join(missing) if missing else
+                      "发票 OCR 主识别完成，缺失字段已按同票身份由模型补齐" if any(x["matched_sources"] == ["MODEL"] for x in comparisons) else
+                      "发票 OCR 必需字段完整且格式有效"}
 
 
 def recognition_cache_key(sha256: str, config, *, ocr_version: int = 0, file_type: str = "", pdf_model=False) -> str:
@@ -164,6 +205,9 @@ def recognition_cache_key(sha256: str, config, *, ocr_version: int = 0, file_typ
                 "connection_version": config.connection_version, "key_token": key_token}
     if file_type == ".pdf":
         material.update(pdf_parser=PDF_TEXT_VERSION, ocr_version=0)
+    from .file_types import IMAGE_SUFFIXES
+    if file_type in IMAGE_SUFFIXES:
+        material["document_policy"] = DOCUMENT_RECOGNITION_VERSION
     return hashlib.sha256(json.dumps(material, sort_keys=True).encode()).hexdigest()
 
 
@@ -171,7 +215,15 @@ def recognition_cache_valid(result: dict, sha256: str, config, *, ocr_version: i
     """成功或明确拒绝的结果复用；临时失败可重试，已有人工确认始终保留。"""
     if result.get("confirmed") and not result.get("error"):
         return True
-    return bool((recognition_passed(result) or result.get("rejected")) and
+    from .file_types import IMAGE_SUFFIXES
+    if result.get("file_type") in {".pdf", *IMAGE_SUFFIXES}:
+        from .document_classification import classification_cache_key
+        classification = result.get("classification") or {}
+        if (result.get("document_policy_version") != DOCUMENT_RECOGNITION_VERSION
+                or classification.get("cache_key") != classification_cache_key(sha256, config)
+                or classification.get("status") != "COMPLETED" or not classification.get("complete")):
+            return False
+    return bool((recognition_passed(result) or result.get("rejected") or result.get("parse_status") == "SKIPPED") and
                 result.get("cache_key") == recognition_cache_key(sha256, config, ocr_version=ocr_version,
                     file_type=result.get("file_type", ""),
                     pdf_model=result.get("file_type") == ".pdf" and "MODEL" in result.get("sources", {})))

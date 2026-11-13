@@ -14,7 +14,7 @@ from .db import begin_write
 from .integrations import DomainError, FeishuGateway, gateway
 from .agent_runtime import model_analyze
 from .ai_logs import AICallRecorder
-from .ai_status import (ACTIVE_AI_STATUSES, can_run_ai_approval, complete_ai_audit,
+from .ai_status import (ACTIVE_AI_STATUSES, can_run_ai_approval, can_run_automatic_audit, complete_ai_audit, payment_collection_enabled,
                         invalidate_ai_audit, reset_ai_audit, settle_ai_audit, start_ai_audit, update_job_ai_audit)
 from .errors import StaleSnapshotError
 from .model_config import audit_config_snapshot, current_audit_fingerprint, load_model_config
@@ -68,7 +68,7 @@ def settle_disabled_ai_work(db, template_code: str | None = None) -> None:
         Job.payload["instance_code"].as_string().in_(approvals)).values(
             status="SUCCEEDED", error="", result={"skipped": "ai_approval_disabled"}))
     db.execute(update(ApprovalAction).where(ApprovalAction.actor_id == "system-agent",
-        ApprovalAction.status == "REQUESTED", ApprovalAction.approval_id.in_(approvals)).values(
+        ApprovalAction.execution_source == "STANDARD", ApprovalAction.status == "REQUESTED", ApprovalAction.approval_id.in_(approvals)).values(
             status="FAILED", error="模板 AI 审批已关闭，已停止自动回写", task_operation_key=None))
     # 归档也可能已有一轮预审在途。仅递增在途终态单据的版本，避免关停再开启时接收旧结果。
     db.execute(update(Approval).where(Approval.id.in_(approvals), Approval.status != "PENDING",
@@ -87,7 +87,15 @@ def invalidate_pending(db, template_code: str | None = None, *, inherited_only=F
     if inherited_only:
         statement = statement.where(func.trim(ApprovalTemplate.agent_prompt) == "")
     count = 0
+    refreshed_payment_templates = set()
     for approval, template in db.execute(statement.order_by(Approval.id)):
+        if payment_collection_enabled(template):
+            # 材料采集不依赖规则或模型语义配置；节点、字段和启用范围变化仍须重新同步。
+            if (reset_pre_review_task or refresh_source) and template.code not in refreshed_payment_templates:
+                from .payment_collection import reset_payment_work
+                reset_payment_work(db, template, reset_nodes=reset_pre_review_task)
+                refreshed_payment_templates.add(template.code)
+            continue
         reviewed = full_review(db, approval)
         if reviewed and template.ai_approval_enabled and not reset_pre_review_task:
             # 配置变化只影响自动审核；已经确认的业务内容继续由人工结论负责。
@@ -110,7 +118,8 @@ def invalidate_pending(db, template_code: str | None = None, *, inherited_only=F
             invalidate_ai_audit(approval)
         approval.version += 1
         if can_run_ai_approval(template):
-            if reviewed:
+            if reviewed or reset_pre_review_task or refresh_source:
+                # 节点范围已失效或源字段改变时先重新同步，不能用被清空的待办直接排队审核。
                 enqueue(db, "REFRESH", {"instance_code": approval.id})
             elif approval.audit_requested:
                 enqueue_automatic_audit(db, approval)
@@ -120,16 +129,26 @@ def invalidate_pending(db, template_code: str | None = None, *, inherited_only=F
 
 def requeue_requested_audit(db, approval: Approval) -> None:
     """回写结束或重启恢复时补发重审。未知回写必须先对账，不提前释放它的操作锁。"""
+    template = db.get(ApprovalTemplate, approval.template_code)
+    if payment_collection_enabled(template):
+        from .payment_collection import enqueue_payment_work
+        approval.audit_requested = False
+        enqueue_payment_work(db, approval)
+        return
     if not approval.audit_requested:
         return
     if full_review(db, approval):
         approval.audit_requested = False
         return
-    template = db.get(ApprovalTemplate, approval.template_code)
     if approval.status != "PENDING" or not template or not template.ai_approval_enabled:
         approval.audit_requested = False
         return
     if not template.active:
+        return
+    if not can_run_automatic_audit(approval, template):
+        # 保留待重审意图，进入专用节点后由同步补发；不能在重启或回写收尾时提前审核。
+        if approval.ai_task_id:
+            settle_ai_audit(approval, approval.ai_task_id, waiting_for_node=True)
         return
     db.flush()
     if not active_approval_action(db, approval.id):
@@ -171,7 +190,11 @@ def active_approval_action(db, approval_id: str) -> str | None:
 def enqueue_automatic_audit(db, approval: Approval) -> None:
     """在写事务内按同单据同版本合并回调与补偿任务，保留回写期间的重审请求。"""
     template = db.get(ApprovalTemplate, approval.template_code)
-    if (approval.status != "PENDING" or not can_run_ai_approval(template)
+    if payment_collection_enabled(template):
+        from .payment_collection import enqueue_payment_work
+        enqueue_payment_work(db, approval)
+        return
+    if (not can_run_automatic_audit(approval, template)
             or audit_result_is_current(db, approval, template)):
         return
     if active_approval_action(db, approval.id):
@@ -511,6 +534,11 @@ def sync_instance(db, instance_code: str, template_code: str | None = None) -> A
     observe_archive(db, approval, snapshot, enqueue)
     if reference_approval(approval):
         enqueue_reference_pdfs(db, approval.id, reference_pdfs(existing), automatic=True)
+    from .budgets import refresh_usage
+    refresh_usage(db, approval)
+    if payment_collection_enabled(template):
+        from .payment_collection import enqueue_payment_work
+        enqueue_payment_work(db, approval, tasks=snapshot.get("task_list") or [])
     db.commit()
     return approval
 
@@ -550,13 +578,19 @@ def reserve_invoice(db, invoice: Invoice, approval: Approval) -> InvoiceClaim | 
         return None
 
 
-def require_current_ai_snapshot(db, instance_code: str, expected_version: int) -> None:
-    """外部请求前使用短读事务复核开关和版本，结束读事务后才允许发送请求。"""
+def require_current_ai_snapshot(db, instance_code: str, expected_version: int, *,
+                                pre_review_task_id: str | None = None) -> None:
+    """外部请求前复核开关和版本；自动审核另绑定原专用待办，人工和归档不传待办限制。"""
     db.rollback()
-    current = db.execute(select(Approval.version, ApprovalTemplate.active, ApprovalTemplate.ai_approval_enabled)
-        .join(ApprovalTemplate).where(Approval.id == instance_code)).one_or_none()
+    current = db.execute(select(Approval, ApprovalTemplate).join(ApprovalTemplate)
+        .where(Approval.id == instance_code)).one_or_none()
+    valid = bool(current and current[0].version == expected_version and can_run_ai_approval(current[1]))
+    node_valid = pre_review_task_id is None or bool(current
+        and can_run_automatic_audit(current[0], current[1]) and current[0].task_id == pre_review_task_id)
     db.rollback()
-    if not current or current != (expected_version, True, True):
+    if not node_valid:
+        raise StaleSnapshotError("已离开本轮专用预审待办，停止自动审核")
+    if not valid:
         raise StaleSnapshotError("AI 审批已关闭或审批版本已变化，已停止本轮处理")
 
 
@@ -571,7 +605,7 @@ def run_audit(db, instance_code: str, *, cached_only=False, suppress_actions=Fal
     begin_write(db)
     approval = db.get(Approval, instance_code)
     if approval:
-        if not db.get(ApprovalTemplate, approval.template_code).ai_approval_enabled:
+        if not can_run_ai_approval(db.get(ApprovalTemplate, approval.template_code)):
             db.commit()
             return {"approval_id": instance_code, "skipped": "ai_approval_disabled"}
         if not (only_if_needed or archive_synced):
@@ -583,10 +617,18 @@ def run_audit(db, instance_code: str, *, cached_only=False, suppress_actions=Fal
     except Exception as exc:
         db.rollback()
         if isinstance(exc, StaleSnapshotError):
-            enabled = db.scalar(select(ApprovalTemplate.ai_approval_enabled).join(Approval).where(Approval.id == instance_code))
-            db.rollback()
-            if enabled is False:
+            begin_write(db)
+            approval = db.get(Approval, instance_code)
+            template = db.get(ApprovalTemplate, approval.template_code) if approval else None
+            enabled = can_run_ai_approval(template)
+            waiting_for_node = only_if_needed and not archive_synced and not can_run_automatic_audit(approval, template)
+            if waiting_for_node and approval:
+                settle_ai_audit(approval, ai_task_id, waiting_for_node=True)
+            db.commit()
+            if not enabled:
                 return {"approval_id": instance_code, "skipped": "ai_approval_disabled"}
+            if waiting_for_node:
+                return {"approval_id": instance_code, "skipped": "pre_review_not_pending"}
         # 后台失败由队列统一决定等待重试还是最终失败，直接调用则没有队列代为收尾。
         if not job_id:
             begin_write(db)
@@ -606,6 +648,10 @@ def _run_audit(db, instance_code: str, ai_task_id: str, *, cached_only: bool, su
     if not can_run_ai_approval(template):
         db.commit()
         return {"approval_id": instance_code, "skipped": "ai_approval_disabled"}
+    if only_if_needed and not archive_synced and not can_run_automatic_audit(approval, template):
+        settle_ai_audit(approval, ai_task_id, waiting_for_node=True)
+        db.commit()
+        return {"approval_id": instance_code, "skipped": "pre_review_not_pending"}
     if only_if_needed or archive_synced:
         # 入队后可能已有别的任务完成审核，也可能已离开原审批阶段。用刚同步的快照重新判断。
         expected_status = "APPROVED" if archive_synced else "PENDING"
@@ -633,6 +679,7 @@ def _run_audit(db, instance_code: str, ai_task_id: str, *, cached_only: bool, su
     human_review = full_review(db, approval, audit=previous_audit, attachments=attachments)
     local_only = cached_only or bool(human_review)
     expected_version, expected_attachments = approval.version, approval.attachment_version
+    pre_review_task_id = approval.task_id if only_if_needed and not archive_synced else None
     config_snapshot = audit_config_snapshot(model_config, template, ocr_version=ocr_config.recognition_version)
     expected_config = config_snapshot["config_fingerprint"]
     # 提交预审进度并脱离 ORM，解析与模型调用期间不持有事务。
@@ -640,7 +687,7 @@ def _run_audit(db, instance_code: str, ai_task_id: str, *, cached_only: bool, su
     db.expunge_all()
 
     def check_current():
-        require_current_ai_snapshot(db, instance_code, expected_version)
+        require_current_ai_snapshot(db, instance_code, expected_version, pre_review_task_id=pre_review_task_id)
 
     evidence, observations, company_ids = [], {}, set()
     if human_review:
@@ -699,7 +746,7 @@ def _run_audit(db, instance_code: str, ai_task_id: str, *, cached_only: bool, su
         if payment:
             material_result = copy.deepcopy(attachment.parsed_data or {}) if local_only else read_payment_material(resolve(attachment.storage_key), model_config, sha256=attachment.sha256,
                 approval_id=approval.id, template_code=template.code, parent_db=db, previous=attachment.parsed_data,
-                invoice_linked=bool(attachment.invoice_id), before_request=check_current)
+                invoice_linked=bool(attachment.invoice_id), before_request=check_current, ocr_config=ocr_config)
             material_result.setdefault("material_type", "UNKNOWN")
             material = material_result.setdefault("material", {})
             payment_materials.append({"attachment_id": attachment.id, "filename": attachment.filename,
@@ -718,15 +765,23 @@ def _run_audit(db, instance_code: str, ai_task_id: str, *, cached_only: bool, su
                     check("MATERIAL_READ", "付款材料读取待确认", False, attachment.filename + "：" + (material.get("error") or material.get("summary", "")))
                     evidence[-1]["reviewable"] = material_result["material_type"] != "UNKNOWN"
                 continue
-        invoice_attachment_count += 1
-        if not local_only and not recognition_cache_valid(attachment.parsed_data or {}, attachment.sha256, model_config,
+        if material_result and material_result.get("document_policy_version"):
+            attachment.parsed_data = copy.deepcopy(material_result)
+        elif not local_only and not recognition_cache_valid(attachment.parsed_data or {}, attachment.sha256, model_config,
                                        ocr_version=ocr_config.recognition_version):
             attachment.parsed_data = parse_with_fallback(resolve(attachment.storage_key), model_config,
                 ocr_config=ocr_config, approval_id=approval.id, template_code=template.code, parent_db=db, sha256=attachment.sha256,
-                previous=attachment.parsed_data, before_request=check_current)
+                previous={**(attachment.parsed_data or {}), **(material_result or {})}, before_request=check_current)
         if material_result:
-            attachment.parsed_data = {**attachment.parsed_data, **material_result}
+            attachment.parsed_data = {**material_result, **attachment.parsed_data, "material": material_result.get("material", {})}
         result = attachment.parsed_data or {}
+        if result.get("parse_status") == "SKIPPED":
+            if attachment.invoice_id:
+                retained_invoice_ids.add(attachment.invoice_id)
+                check("MATERIAL_RECLASSIFICATION", "已入台账发票类别变更", False,
+                      attachment.filename + " 已关联发票台账，请核对原件", result="UNKNOWN")
+            continue
+        invoice_attachment_count += 1
         attachment.parsed_data = {**result, "parse_status": "FAILED" if result.get("error") else "PARSED"}
         previous_invoice_id = attachment.invoice_id
         # 原件仍在，只是本次识别暂时失败时，保留已有占用，防止识别重试意外释放票据。
@@ -768,7 +823,7 @@ def _run_audit(db, instance_code: str, ai_task_id: str, *, cached_only: bool, su
                   f"当前有 {len(reference_pdf_ids)} 份包内 PDF，请查看历史附件补充识别结果", result="SKIPPED")
         else:
             check("ATTACHMENTS", "发票原件完整性", invoice_attachment_count > 0 and not unread_archive,
-                  f"已获取 {invoice_attachment_count} 个发票格式附件，另有 {len(attachments)-invoice_attachment_count} 个其他附件",
+                  f"已获取 {invoice_attachment_count} 个发票或待确认附件，另有 {len(attachments)-invoice_attachment_count} 个其他附件",
                   result="UNKNOWN" if unread_archive else None)
     prompt = config_snapshot["prompt"]
     if has_partial_contract:
@@ -814,10 +869,19 @@ def _run_audit(db, instance_code: str, ai_task_id: str, *, cached_only: bool, su
     template = db.get(ApprovalTemplate, approval.template_code)
     attachments = list(db.scalars(select(Attachment).where(Attachment.approval_id == approval.id, Attachment.active.is_(True))))
     active_operation = approval.status == "PENDING" and active_approval_action(db, approval.id)
-    if not template.ai_approval_enabled:
+    if not can_run_ai_approval(template):
         # 关停事务已清除任务归属，已发送的模型请求可保留日志，结果和附件解析均不入业务库。
         db.commit()
         return {"approval_id": instance_code, "skipped": "ai_approval_disabled"}
+    if pre_review_task_id is not None and (
+            not can_run_automatic_audit(approval, template) or approval.task_id != pre_review_task_id):
+        # 即使外部调用已经完成，也不能把旧节点的识别、占用或审核结论写入新阶段。
+        settle_ai_audit(approval, ai_task_id, waiting_for_node=True)
+        if can_run_automatic_audit(approval, template):
+            approval.audit_requested = True
+            requeue_requested_audit(db, approval)
+        db.commit()
+        return {"approval_id": instance_code, "skipped": "pre_review_not_pending"}
     if full_review(db, approval) and not human_review:
         # AI 执行期间已经完成整单复核，旧结果不能覆盖人工判断或再安排一次 AI 审批。
         approval.audit_requested = False
@@ -916,7 +980,7 @@ def _run_audit(db, instance_code: str, ai_task_id: str, *, cached_only: bool, su
         check("CANONICAL", "历史票面信息一致性", same_canonical,
               f"发票 {fields['number']} 与统一票据库的税号、日期、金额核对" + ("；" + "；".join(differences) if differences else "，一致"))
         check("RELIABILITY", "关键字段可靠性", item["reliable"],
-              f"发票 {fields['number']}：" + ("本地完整解析、结构化解析或已人工确认" if item["reliable"] else
+              f"发票 {fields['number']}：" + ("字段来自本地解析、发票 OCR 或人工确认" if item["reliable"] else
                   "字段来自文字、OCR 或模型；来源提示不影响通过，识别一致性单独核验"), "INFO")
         today = datetime.now(timezone(timedelta(hours=8))).date()
         check("DATE", "开票日期检查", date.fromisoformat(fields["issue_date"]) <= today,
@@ -1011,6 +1075,8 @@ def _run_audit(db, instance_code: str, ai_task_id: str, *, cached_only: bool, su
     approval.audit_requested = False
     complete_ai_audit(approval, ai_task_id)
     approval.company_ids = sorted(company_ids)
+    from .budgets import refresh_usage
+    refresh_usage(db, approval)
     approval.version += 1
     log(db, "审批 Agent", "完成付款预审" if payment else "完成发票预审", approval.serial_number, {"conclusion": conclusion, "audit_id": audit.id})
     if (not suppress_actions and not human_review and not has_partial_contract and not unread_archive and template.mode == "AUTO"
@@ -1035,10 +1101,12 @@ def _run_audit(db, instance_code: str, ai_task_id: str, *, cached_only: bool, su
 
 
 def request_action(db, approval, action: str, comment: str, expected_version: int,
-                   idempotency_key: str, actor_id: str, actor_name: str, *, source_audit_id: str | None = None) -> ApprovalAction:
+                   idempotency_key: str, actor_id: str, actor_name: str, *, source_audit_id: str | None = None,
+                   execution_source: str = "STANDARD") -> ApprovalAction:
+    """统一创建回写；仅系统付款采集操作可绕过审核，身份、版本和唯一待办锁始终保留。"""
     previous = db.scalar(select(ApprovalAction).where(ApprovalAction.idempotency_key == idempotency_key))
     if previous:
-        if (previous.approval_id, previous.action, previous.comment) != (approval.id, action, comment):
+        if (previous.approval_id, previous.action, previous.comment, previous.execution_source) != (approval.id, action, comment, execution_source):
             raise DomainError("同一幂等标识不能用于不同操作")
         return previous
     if approval.version != expected_version:
@@ -1046,19 +1114,26 @@ def request_action(db, approval, action: str, comment: str, expected_version: in
     template = db.get(ApprovalTemplate, approval.template_code)
     if not template.active:
         raise DomainError("审批模板已停用，请先由管理员确认接入配置")
-    if actor_id == "system-agent" and not template.ai_approval_enabled:
+    collecting = payment_collection_enabled(template)
+    passthrough = execution_source == "PAYMENT_AUTO_APPROVE"
+    if execution_source not in {"STANDARD", "PAYMENT_AUTO_APPROVE"}:
+        raise DomainError("未知的审批操作来源")
+    if collecting != passthrough or (passthrough and (actor_id != "system-agent" or action != "APPROVE" or source_audit_id)):
+        raise DomainError("付款仅采集模式只允许系统自动同意专用节点，请刷新当前处理策略")
+    if actor_id == "system-agent" and not passthrough and not can_run_ai_approval(template):
         raise DomainError("模板 AI 审批已关闭，请由财务人工处理")
     if (approval.status != "PENDING" or approval.task_status != "PENDING" or not approval.task_id
             or approval.assignee != template.reviewer_open_id):
         raise DomainError("当前不是可操作的专用预审待办")
-    _check_partial_contract_action(db, approval, actor_id)
-    if action == "APPROVE" and not template.ai_approval_enabled and not full_review(db, approval):
+    if not passthrough:
+        _check_partial_contract_action(db, approval, actor_id)
+    if not passthrough and action == "APPROVE" and not template.ai_approval_enabled and not full_review(db, approval):
         raise DomainError("模板 AI 审批已关闭，请先完成整单人工复核")
-    if action == "APPROVE" and (approval.decision != "PASS" or approval.audit_attachment_version != approval.attachment_version):
+    if not passthrough and action == "APPROVE" and (approval.decision != "PASS" or approval.audit_attachment_version != approval.attachment_version):
         raise DomainError("请先完成规则审核或整单人工复核后再同意")
-    if action == "APPROVE" and not audit_config_matches(db, approval, template):
+    if not passthrough and action == "APPROVE" and not audit_config_matches(db, approval, template):
         raise DomainError("模型、节点提示词或审核规则已变化，请重新审核后再同意")
-    if actor_id == "system-agent":
+    if actor_id == "system-agent" and not passthrough:
         if full_review(db, approval):
             raise DomainError("当前已有整单人工复核，请由财务手动处理预审节点")
         if explicit_rules(template.rules) and not has_approval_conditions(template.rules):
@@ -1082,6 +1157,7 @@ def request_action(db, approval, action: str, comment: str, expected_version: in
     if action == "APPROVE" and actor_id != "system-agent" and full_review(db, approval):
         source_audit_id = approval.last_audit_id
     record = ApprovalAction(idempotency_key=idempotency_key, task_operation_key=operation_key, source_audit_id=source_audit_id,
+        execution_source=execution_source,
         approval_id=approval.id, task_id=approval.task_id, actor_id=actor_id, actor_name=actor_name,
         feishu_identity=template.reviewer_open_id, action=action, comment=comment, expected_version=expected_version)
     db.add(record)
@@ -1126,13 +1202,18 @@ def execute_action(db, action_id: str) -> dict:
             if record.status == "FAILED":
                 raise DomainError(record.error or "该操作已停止，请刷新审批后重新提交")
             auto = record.actor_id == "system-agent"
-            auto_allowed = can_run_ai_approval(template) and template.mode == "AUTO"
-            if (reconciling and auto and original_task.get("status") == "PENDING"
-                    and (not auto_allowed or approval.version != record.expected_version)):
+            passthrough = record.execution_source == "PAYMENT_AUTO_APPROVE"
+            collecting = payment_collection_enabled(template)
+            auto_allowed = (collecting if passthrough else can_run_ai_approval(template) and template.mode == "AUTO")
+            if (reconciling and original_task.get("status") == "PENDING"
+                    and (collecting != passthrough or (auto and not auto_allowed)
+                         or approval.version != record.expected_version)):
                 # 飞书仍显示待办时，已发出的请求可能尚未可见。只继续对账，禁止重发或释放操作锁。
                 raise RuntimeError("旧自动回写仍在等待飞书确认")
             if not template.active or (auto and not auto_allowed):
                 raise DomainError("模板已停用或 AI 自动处理已关闭")
+            if collecting != passthrough or (passthrough and (not auto or record.action != "APPROVE" or record.source_audit_id)):
+                raise DomainError("付款处理策略已变化，已停止旧操作")
             if record.actor_id != "system-agent":
                 from .models import User
                 actor = db.get(User, record.actor_id)
@@ -1149,8 +1230,9 @@ def execute_action(db, action_id: str) -> dict:
                         and not audit_result_is_current(db, approval, template)):
                     approval.audit_requested = True
                 raise DomainError("飞书待办或附件版本已变化，已停止回写，请重新审核")
-            _check_partial_contract_action(db, approval, record.actor_id)
-            if record.actor_id == "system-agent":
+            if not passthrough:
+                _check_partial_contract_action(db, approval, record.actor_id)
+            if auto and not passthrough:
                 if full_review(db, approval):
                     raise DomainError("已有有效整单人工复核，已停止自动操作，请由财务手动处理")
                 # 自动拒绝与自动同意使用同样的有效快照边界，不能只保护同意路径。
@@ -1163,7 +1245,7 @@ def execute_action(db, action_id: str) -> dict:
                     raise DomainError("自动操作的审核配置或来源结论已变化，已停止回写并安排重新审核")
                 if record.action == "REJECT" and (not configurable(template.rules) or not rejection_items(audit.evidence)):
                     raise DomainError("拒绝标准已失效，已停止自动拒绝")
-            if record.action == "APPROVE":
+            if record.action == "APPROVE" and not passthrough:
                 manual = full_review(db, approval) if record.actor_id != "system-agent" else None
                 if manual and record.source_audit_id != approval.last_audit_id:
                     raise DomainError("人工复核来源已变化，请刷新后重新提交同意")
@@ -1190,7 +1272,21 @@ def execute_action(db, action_id: str) -> dict:
                 remote = gateway(db)
                 operation = (approval.template_code, approval.id, record.task_id,
                              record.feishu_identity, record.action, record.comment)
-                if auto:
+                if passthrough:
+                    # 发送前最后检查策略、节点范围和版本；采集进度不参与版本计算。
+                    db.rollback()
+                    db.expire_all()
+                    latest = db.get(Approval, operation[1])
+                    latest_template = db.get(ApprovalTemplate, latest.template_code)
+                    latest_record = db.get(ApprovalAction, action_id)
+                    if (not latest_template.active or not payment_collection_enabled(latest_template)
+                            or latest.version != latest_record.expected_version or latest.status != "PENDING"
+                            or latest.task_id != latest_record.task_id or latest.task_status != "PENDING"
+                            or latest.assignee != latest_template.reviewer_open_id
+                            or latest_record.feishu_identity != latest_template.reviewer_open_id):
+                        raise DomainError("付款仅采集策略或待办已变化，已停止回写")
+                    db.rollback()
+                elif auto:
                     try:
                         require_current_ai_snapshot(db, approval.id, record.expected_version)
                     except StaleSnapshotError as exc:
@@ -1236,7 +1332,7 @@ def execute_action(db, action_id: str) -> dict:
         update_capability(template, "task_write")
     log(db, record.actor_name, "同意预审" if record.action == "APPROVE" else "拒绝预审", approval.serial_number,
         {"comment": record.comment, "feishu_identity": record.feishu_identity, "action_id": record.id,
-         "source_audit_id": record.source_audit_id})
+         "source_audit_id": record.source_audit_id, "execution_source": record.execution_source})
     db.commit()
     if template.active:
         approval = sync_instance(db, approval.id)
@@ -1338,7 +1434,10 @@ def archive_approval(db, instance_code: str, *, already_synced: bool = False) ->
                            "serial_number": approval.serial_number,
                            "invoice_number": confirmed_fields.get("number") or (invoice.number if invoice else None),
                            "buyer_tax_id": confirmed_fields.get("buyer_tax_id") or (invoice.buyer_tax_id if invoice else None),
-                           "verification": "UNVERIFIED", "audit_id": approval.last_audit_id,
+                           "verification": "UNVERIFIED",
+                           "audit_id": None if payment_collection_enabled(template) else approval.last_audit_id,
+                           "payment_collection_only": payment_collection_enabled(template),
+                           "payment_collection_task_id": approval.payment_collection_task_id if payment_collection_enabled(template) else None,
                            "attachment_version": approval.attachment_version, "business_type": approval.business_type,
                            "material_type": kind,
                            "invoice_parse_skipped": ordinary, "manual_exception": exception,
@@ -1420,6 +1519,9 @@ def sync_all(db) -> dict:
 
 def refresh_original(db, instance_code: str) -> dict:
     approval = sync_instance(db, instance_code)
+    begin_write(db)
+    enqueue_automatic_audit(db, approval)
+    db.commit()
     return {"approval_id": approval.id, "status": approval.status}
 
 

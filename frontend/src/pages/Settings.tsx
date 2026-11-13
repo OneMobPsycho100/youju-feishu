@@ -47,6 +47,7 @@ import { AICallLogs } from "../components/AICallLogs";
 import { AuditRuleSettings } from "../components/AuditRuleSettings";
 import { SyncConfiguration } from "../components/SyncConfiguration";
 import { OCRConfiguration } from "../components/OCRConfiguration";
+import { InvoiceDeductionRules } from "../components/InvoiceDeductionRules";
 import { defaultEntries, editableRules } from "../auditRules";
 import type { ApprovalDefinition, TemplateInspection } from "../templateTransfer";
 import { downloadTemplates, emptyFieldMapping, scalarMappingFields } from "../templateTransfer";
@@ -98,6 +99,7 @@ function CompanySettings() {
   const { companies, refresh } = useWorkbench();
   const { message } = AntApp.useApp();
   const [editing, setEditing] = useState<Company | "new" | null>(null);
+  const [deductionCompany, setDeductionCompany] = useState<Company | null>(null);
   const [busy, setBusy] = useState(false);
   const [form] = Form.useForm();
   const open = (company: Company | "new") => {
@@ -185,13 +187,10 @@ function CompanySettings() {
             title: "操作",
             key: "edit",
             render: (_, row) => (
-              <Button
-                type="link"
-                icon={<EditOutlined />}
-                onClick={() => open(row)}
-              >
-                编辑
-              </Button>
+              <Space size={0}>
+                <Button type="link" icon={<EditOutlined />} onClick={() => open(row)}>编辑</Button>
+                <Button type="link" onClick={() => setDeductionCompany(row)}>抵扣规则</Button>
+              </Space>
             ),
           },
         ]}
@@ -238,6 +237,17 @@ function CompanySettings() {
           </Form.Item>
         </Form>
       </Modal>
+      {deductionCompany && (
+        <InvoiceDeductionRules
+          key={deductionCompany.id}
+          company={deductionCompany}
+          onClose={() => setDeductionCompany(null)}
+          onSaved={() => {
+            setDeductionCompany(null);
+            refresh();
+          }}
+        />
+      )}
     </>
   );
 }
@@ -386,6 +396,7 @@ function TemplateSettings() {
     setBusy(true);
     const data = {
       ...values,
+      payment_auto_approve_enabled: values.business_type === "PAYMENT" ? values.payment_auto_approve_enabled ?? true : false,
       field_mapping: {
         ...values.field_mapping,
         attachment_ids: values.field_mapping?.attachment_ids || [],
@@ -394,7 +405,7 @@ function TemplateSettings() {
     };
     try {
       const saved = await put<ApprovalTemplate>(`/api/v1/templates/${encodeURIComponent(values.code)}`, data);
-      message.success(saved.ai_approval_enabled
+      message.success(saved.payment_auto_approve_enabled ? "付款配置已保存，仅采集并自动同意专用节点，包含存量待办" : saved.ai_approval_enabled
         ? "模板配置已保存，待办将重新审核。节点、审批人或映射变化后进入观察模式"
         : "模板配置已保存，待办由财务整单人工复核");
       setEditing(null);
@@ -435,6 +446,19 @@ function TemplateSettings() {
       setBusy(false);
     }
   };
+  const togglePaymentCollection = async (template: ApprovalTemplate, enabled: boolean) => {
+    setBusy(true);
+    try {
+      await put(`/api/v1/templates/${encodeURIComponent(template.code)}/payment-auto-approval`, { payment_auto_approve_enabled: enabled });
+      message.success(enabled ? "付款仅采集已开启，存量专用待办将核对后自动同意" : "付款仅采集已关闭，已恢复原审核配置");
+      await resource.reload();
+      refresh();
+    } catch (reason) {
+      message.error((reason as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
   const toggle = async (template: ApprovalTemplate, checked: boolean) => {
     setBusy(true);
     try {
@@ -461,7 +485,7 @@ function TemplateSettings() {
     <>
       <SectionTitle
         title="审批接入与规则"
-        help="模板默认由财务人工预审。开启 AI 审批后进入观察模式。完成接入验证和一次人工回写后，可单独开启自动处理。"
+        help="付款默认仅采集材料并自动同意专用节点；关闭后恢复原审核配置。报销默认由财务人工预审，开启 AI 后可配置按规则自动处理。"
         action={
           <Space wrap>
             <TemplateTransferActions templates={resource.data || []} users={userResource.data || []}
@@ -490,6 +514,7 @@ function TemplateSettings() {
         empty={!resource.loading && !resource.data?.length}
       >
         {resource.data?.map((template) => {
+          const collecting = template.business_type === "PAYMENT" && template.payment_auto_approve_enabled;
           const ready =
             template.subscribed &&
             Object.keys(capabilityLabels).every(
@@ -501,7 +526,7 @@ function TemplateSettings() {
                 <div>
                   <h3>
                     {template.name}
-                    {template.ai_approval_enabled
+                    {collecting ? <Tag color="cyan">仅采集 · 自动同意</Tag> : template.ai_approval_enabled
                       ? <Tag color={template.mode === "AUTO" ? "success" : "blue"}>
                         {template.mode === "AUTO" ? (template.rules.policy_schema_version || 1) >= 2 ? "按规则自动处理" : "低风险自动同意" : "观察模式"}
                       </Tag>
@@ -551,23 +576,29 @@ function TemplateSettings() {
                   {template.rules.policy_schema_version !== 3 && " · 保存配置后启用可删除规则列表"}
                 </span>
                 <Space wrap size={16}>
+                  {template.business_type === "PAYMENT" && <Space>
+                    <span>仅采集，自动同意</span>
+                    <Switch aria-label="付款仅采集，自动同意" checked={collecting}
+                      disabled={busy} onChange={(checked) => void togglePaymentCollection(template, checked)} />
+                  </Space>}
                   <Space>
                     <span>开启 AI 审批</span>
                     <Switch aria-label="开启 AI 审批" checked={template.ai_approval_enabled}
-                      disabled={busy} onChange={(checked) => void toggleAIApproval(template, checked)} />
+                      disabled={busy || collecting} onChange={(checked) => void toggleAIApproval(template, checked)} />
                   </Space>
                   <Space>
                     <span>{(template.rules.policy_schema_version || 1) >= 2 ? "自动同意 / 按规则拒绝" : "自动同意低风险预审"}</span>
                     <Switch
                       aria-label="开启自动处理"
                       checked={template.ai_approval_enabled && template.mode === "AUTO"}
-                      disabled={busy || !template.ai_approval_enabled || (!ready && template.mode !== "AUTO")}
+                      disabled={busy || collecting || !template.ai_approval_enabled || (!ready && template.mode !== "AUTO")}
                       onChange={(checked) => void toggle(template, checked)}
                     />
                   </Space>
                 </Space>
               </div>
-              {template.ai_approval_enabled && !ready && (
+              {collecting && <p className="template-ready-note">材料解析仅作记录，不执行付款规则审核；原 AI 与自动处理配置已保留，关闭仅采集后恢复。</p>}
+              {!collecting && template.ai_approval_enabled && !ready && (
                 <p className="template-ready-note">
                   先在观察模式完成人工回写，再开启自动处理。
                 </p>
@@ -656,6 +687,10 @@ function TemplateSettings() {
                   placeholder="有现成的预审待办时可提供样本，无需创建测试审批" />
               </Form.Item>
             </details>
+            {businessType === "PAYMENT" && <Form.Item name="payment_auto_approve_enabled" label="仅采集，自动同意" valuePropName="checked" initialValue={true}
+              extra="自动同意专用节点并保留材料解析，包含存量待办；关闭后恢复原审核配置。">
+              <Switch />
+            </Form.Item>}
             <details className="template-setup-details">
               <summary>审核规则与提示词</summary>
           <h4>预审规则</h4>
@@ -922,6 +957,8 @@ function JobSettings() {
     REFRESH: "撤销原单状态对账",
     IMPORT: "历史台账导入",
     REIMBURSEMENT_METADATA: "报销统计元数据补齐",
+    PAYMENT_APPROVAL_TIME: "付款通过时间补齐",
+    BUDGET_USAGE_BACKFILL: "报销预算历史建账",
     APPROVAL_APPLICANT_NAME: "申请人姓名补齐",
   };
   const retry = async (job: Job) => {

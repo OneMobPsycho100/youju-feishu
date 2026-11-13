@@ -1,6 +1,6 @@
 """审批归档补齐。只保存飞书打印资料和原件索引，不进入预审或审批回写。"""
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import timedelta
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -19,7 +19,7 @@ from .integrations import FeishuGateway, gateway
 from .invoice_recognition import normalized_candidate
 from .models import Approval, ApprovalTemplate, Attachment, Company, Job, User
 from .payment_service import decoded, display
-from .reimbursement_metadata import feishu_time, snapshot_metadata
+from .reimbursement_metadata import approved_at_from_snapshot, feishu_time, snapshot_metadata
 from .storage import resolve, safe_name, save_original
 from .template_transfer import ATTACHMENT_TYPES, GROUP_TYPES
 
@@ -126,15 +126,6 @@ def archive_sources(snapshot: dict, mapped_ids: list[str]) -> list[dict]:
     return sources
 
 
-def _approval_end(snapshot: dict) -> datetime | None:
-    """撤销快照的结束时间可能属于撤销动作，已有的最终通过时间继续保留。"""
-    if snapshot.get("status") != "APPROVED" or snapshot.get("reverted") is True:
-        return None
-    end = feishu_time(snapshot.get("end_time"))
-    start = feishu_time(snapshot.get("start_time"))
-    return end if end and (not start or end >= start) else None
-
-
 def _history_items(snapshot: dict, key: str) -> list[dict]:
     return [item for item in snapshot.get(key) or [] if isinstance(item, dict)]
 
@@ -152,7 +143,7 @@ def observe_archive(db, approval: Approval, snapshot: dict, enqueue) -> None:
     """同步终态时登记通过时间，并为发生变化的全单资料安排独立补齐。"""
     if approval.status != "APPROVED":
         return
-    if end := _approval_end(snapshot):
+    if end := approved_at_from_snapshot(snapshot):
         approval.approved_at = end
     template = db.get(ApprovalTemplate, approval.template_code)
     mapped_ids = (template.field_mapping or {}).get("attachment_ids") or []
@@ -473,7 +464,7 @@ def backfill_archive(db, instance_code: str) -> dict:
     patch = {"archive_snapshot": captured}
     if not current.submitted_at and (submitted := snapshot_metadata(snapshot).get("submitted_at")):
         patch["submitted_at"] = submitted
-    if end := _approval_end(snapshot):
+    if end := approved_at_from_snapshot(snapshot):
         patch["approved_at"] = end
     db.execute(update(Approval).where(Approval.id == instance_code).values(**patch, updated_at=Approval.updated_at))
     db.commit()
