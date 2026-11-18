@@ -3,6 +3,7 @@ import {
   App as AntApp,
   Alert,
   Button,
+  Collapse,
   Descriptions,
   Drawer,
   Empty,
@@ -70,6 +71,12 @@ const paymentActionLabels: Record<Approval["payment_auto_approval_status"], stri
   NOT_STARTED: "等待节点核对", REQUESTED: "自动同意已入队", EXECUTING: "自动同意回写中", UNKNOWN: "同意结果核对中",
   SUCCEEDED: "专用节点已自动同意", FAILED: "自动同意已停止",
 };
+
+/** 逐附件或逐张发票生成的规则编码，兼容历史记录和自定义规则标题。 */
+const attachmentEvidenceCodes = new Set([
+  "RECOGNITION", "COMPANY", "BUYER_NAME", "CLAIM_COMPANY",
+  "CANONICAL", "RELIABILITY", "DATE", "DUPLICATE",
+]);
 
 /** 采集、回写分别轮询，避免材料完成后过早停止刷新未知回写结果。 */
 function paymentWorkActive(row: Approval) {
@@ -315,6 +322,17 @@ function accountText(value: unknown): string {
   return typeof value === "string" ? value : JSON.stringify(value, null, 2);
 }
 
+const automaticAttachmentStem = /^(?:[a-f0-9]{32}|[a-f0-9]{40}|[a-f0-9]{64}|[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}|[0-9]{16,}|附件(?:-[0-9]+)?|file)$/i;
+
+/** 分类按原件内容复用，展示时再根据当前文件名判断是否采用描述。 */
+function attachmentDescription(file?: Attachment): string | undefined {
+  if (!file) return;
+  const classification = file.parsed_data.classification;
+  if (classification?.status !== "COMPLETED" || !classification.complete) return;
+  const stem = file.filename.replace(/\.[^.]+$/, "");
+  return automaticAttachmentStem.test(stem) ? classification.description?.trim() || undefined : undefined;
+}
+
 /** 展示原件定位及完整读取状态，Office 材料不渲染成发票票面。 */
 function MaterialText({ attachment }: { attachment: Attachment }) {
   const material = attachment.parsed_data.material;
@@ -469,9 +487,8 @@ export function ApprovalDrawer({
   const [correctionForm] = Form.useForm();
   const [reviewForm] = Form.useForm();
   const [materialForm] = Form.useForm();
-  const attachment =
-    row?.attachments.find((x) => x.id === selectedAttachment) ||
-    row?.attachments.find((x) => x.active);
+  const attachmentsById = new Map(row?.attachments.map((file) => [file.id, file] as const));
+  const attachment = attachmentsById.get(selectedAttachment) || row?.attachments.find((file) => file.active);
   const memberSources = new Map(row?.attachments.flatMap((parent) =>
     parent.parsed_data.archive?.members.map((member) =>
       [member.attachment_id, { path: member.path, parent }] as const) ?? []) ?? []);
@@ -534,6 +551,19 @@ export function ApprovalDrawer({
   const rejectionEvidence = pendingEvidence.filter((item) => item.auto_reject_eligible);
   const wasReviewed = (item: Evidence) => item.reviewed || (!item.source && item.code === "SEMANTIC"
     && row?.audit?.model_analysis.manual_review?.reviewed_codes.includes("SEMANTIC"));
+  const evidence = row?.audit?.evidence ?? [];
+  const visibleEvidence: number[] = [];
+  const passedAttachmentEvidence: number[] = [];
+  const isAgentPreReview = row?.ai_approval_enabled && !row.payment_auto_approve_enabled;
+  evidence.forEach((item, index) => {
+    // 已跳过和人工放行也可能标记为 passed，收起时以原始判定为准。
+    if (isAgentPreReview && attachmentEvidenceCodes.has(item.code) && item.passed
+      && (item.result == null || item.result === "PASS") && !wasReviewed(item)) {
+      passedAttachmentEvidence.push(index);
+    } else {
+      visibleEvidence.push(index);
+    }
+  });
   const automaticRejection = !row?.payment_auto_approve_enabled && row?.actions.find((item) => item.action === "REJECT" && item.source_audit_id
     && (item.source_audit_id === row.audit?.id || row.status === "REJECTED"));
   const startReview = () => {
@@ -634,6 +664,49 @@ export function ApprovalDrawer({
       await resource.reload();
     } catch (reason) { message.error((reason as Error).message); }
     finally { setBusy(false); }
+  };
+  const renderEvidence = (index: number) => {
+    const item = evidence[index];
+    const key = `${item.code}-${index}`;
+    if (referenceSummary && ["ATTACHMENTS", "AMOUNT"].includes(item.code)) {
+      return (
+        <details className="audit-technical-evidence" key={key}>
+          <summary>原预审 · {item.title}</summary>
+          <p>{item.detail}</p>
+        </details>
+      );
+    }
+
+    const reviewed = wasReviewed(item);
+    const skipped = item.result === "SKIPPED";
+    const info = item.severity === "INFO";
+    const blocked = item.severity === "BLOCK";
+    return (
+      <div className={`evidence-row ${skipped ? "info" : item.passed ? "passed" : info ? "info" : blocked ? "blocked" : "review"}`} key={key}>
+        <span className="evidence-icon">
+          {skipped ? <InfoCircleOutlined /> : item.passed ? <CheckCircleFilled /> : info ? <InfoCircleOutlined /> : <span>!</span>}
+        </span>
+        <div>
+          <strong>{item.title}</strong>
+          {item.source === "CUSTOM" && <Tag className="rule-source-tag">文字标准</Tag>}
+          <p>{reviewed ? "原判定依据：" : ""}{item.user_message || item.detail}</p>
+          {item.user_message && <details className="audit-technical-evidence">
+            <summary>查看核对依据</summary><p>{item.detail}</p>
+          </details>}
+          {reviewed && <p>此项已人工确认，复核意见详见操作留痕。</p>}
+          {item.related_approval && (
+            <Button size="small" type="link" onClick={() => navigate(`approvals/${item.related_approval}`)}>
+              查看关联审批
+              <LinkOutlined />
+            </Button>
+          )}
+        </div>
+        <Tag color={skipped ? "default" : item.passed ? "success" : info ? "default" : blocked ? "error" : "warning"}>
+          {skipped ? "已跳过" : item.passed ? (reviewed ? "人工通过" : "通过")
+            : item.auto_reject_eligible ? "拒绝" : item.result === "UNKNOWN" ? "待确认" : info ? "提示" : blocked ? "阻断" : "需复核"}
+        </Tag>
+      </div>
+    );
   };
   return (
     <Drawer
@@ -919,68 +992,23 @@ export function ApprovalDrawer({
                           referenceSummary.pending_count > 0 ? referenceSummary.pending_count + " 份待识别" : "",
                         ].filter(Boolean).join(" · ")}
                       />}
-                      {!row.ai_approval_enabled && !!row.audit?.evidence.length && <h4>历史预审依据</h4>}
-                      <div className="audit-evidence-list">
-                        {row.audit?.evidence.map((item, index) => referenceSummary && ["ATTACHMENTS", "AMOUNT"].includes(item.code) ? (
-                          <details className="audit-technical-evidence" key={item.code + "-" + index}>
-                            <summary>原预审 · {item.title}</summary>
-                            <p>{item.detail}</p>
-                          </details>
-                        ) : (
-                          <div
-                            className={`evidence-row ${item.result === "SKIPPED" ? "info" : item.passed ? "passed" : item.severity === "INFO" ? "info" : item.severity === "BLOCK" ? "blocked" : "review"}`}
-                            key={`${item.code}-${index}`}
-                          >
-                            <span className="evidence-icon">
-                              {item.result === "SKIPPED" ? <InfoCircleOutlined /> : item.passed ? (
-                                <CheckCircleFilled />
-                              ) : item.severity === "INFO" ? (
-                                <InfoCircleOutlined />
-                              ) : (
-                                <span>!</span>
-                              )}
-                            </span>
-                            <div>
-                              <strong>{item.title}</strong>
-                              {item.source === "CUSTOM" && <Tag className="rule-source-tag">文字标准</Tag>}
-                              <p>{wasReviewed(item) ? "原判定依据：" : ""}{item.user_message || item.detail}</p>
-                              {item.user_message && <details className="audit-technical-evidence">
-                                <summary>查看核对依据</summary><p>{item.detail}</p>
-                              </details>}
-                              {wasReviewed(item) && <p>此项已人工确认，复核意见详见操作留痕。</p>}
-                              {item.related_approval && (
-                                <Button
-                                  size="small"
-                                  type="link"
-                                  onClick={() =>
-                                    navigate(
-                                      `approvals/${item.related_approval}`,
-                                    )
-                                  }
-                                >
-                                  查看关联审批
-                                  <LinkOutlined />
-                                </Button>
-                              )}
-                            </div>
-                            <Tag
-                              color={
-                                item.result === "SKIPPED" ? "default" : item.passed
-                                  ? "success"
-                                  : item.severity === "INFO" ? "default" : item.severity === "BLOCK"
-                                    ? "error"
-                                    : "warning"
-                              }
-                            >
-                              {item.result === "SKIPPED" ? "已跳过" : item.passed
-                                ? wasReviewed(item) ? "人工通过" : "通过"
-                                : item.auto_reject_eligible ? "拒绝" : item.result === "UNKNOWN" ? "待确认" : item.severity === "INFO" ? "提示" : item.severity === "BLOCK"
-                                  ? "阻断"
-                                  : "需复核"}
-                            </Tag>
-                          </div>
-                        ))}
-                      </div>
+                      {!row.ai_approval_enabled && evidence.length > 0 && <h4>历史预审依据</h4>}
+                      {passedAttachmentEvidence.length > 0 && (
+                        <Collapse
+                          key={row.id}
+                          size="small"
+                          destroyOnHidden
+                          style={{ marginBottom: 8 }}
+                          items={[{
+                            key: "passed-attachments",
+                            label: `已通过的附件与票据核验（${passedAttachmentEvidence.length} 条）`,
+                            children: <div className="audit-evidence-list">{passedAttachmentEvidence.map(renderEvidence)}</div>,
+                          }]}
+                        />
+                      )}
+                      {visibleEvidence.length > 0 && (
+                        <div className="audit-evidence-list">{visibleEvidence.map(renderEvidence)}</div>
+                      )}
                       {row.audit && (
                         <div className="model-summary">
                           {row.audit.model_analysis.manual_review && (
@@ -1070,23 +1098,26 @@ export function ApprovalDrawer({
                       <div className="attachment-list">
                         {attachmentGroups.filter((group) => group.files.length > 0).map((group) => <section className="attachment-group" key={group.label}>
                           <h4>{group.label} ({group.files.length})</h4>
-                          {group.files.map((file) => (
-                          <button
-                            key={file.id}
-                            onClick={() => setSelectedAttachment(file.id)}
-                            className={`attachment-item ${attachment?.id === file.id ? "selected" : ""} ${!file.active ? "inactive" : ""}`}
-                          >
-                            <FileTextOutlined />
-                            <div>
-                              <strong>{file.filename}</strong>
-                              {memberSources.has(file.id) && <small title={memberSources.get(file.id)?.path}>包内 · {memberSources.get(file.id)?.path}</small>}
-                              <small>
-                                {bytes(file.size)} ·{" "}
-                                {file.active ? fileRecognitionLabel(file) : "历史版本"}
-                              </small>
-                            </div>
-                          </button>
-                          ))}
+                          {group.files.map((file) => {
+                            const description = attachmentDescription(file);
+                            const memberPath = memberSources.get(file.id)?.path;
+                            return <button
+                              key={file.id}
+                              onClick={() => setSelectedAttachment(file.id)}
+                              className={`attachment-item ${attachment?.id === file.id ? "selected" : ""} ${!file.active ? "inactive" : ""}`}
+                              title={description ? memberPath || file.filename : undefined}
+                            >
+                              <FileTextOutlined />
+                              <div>
+                                <strong>{description || file.filename}</strong>
+                                {memberPath && !description && <small title={memberPath}>包内 · {memberPath}</small>}
+                                <small>
+                                  {bytes(file.size)} ·{" "}
+                                  {file.active ? fileRecognitionLabel(file) : "历史版本"}
+                                </small>
+                              </div>
+                            </button>;
+                          })}
                         </section>)}
                       </div>
                       <div className="attachment-preview-wrap" ref={attachmentPreview}>
@@ -1137,13 +1168,19 @@ export function ApprovalDrawer({
                               />
                             )}
                             {selectedSource && <p className="muted break-word">包内来源 · {selectedSource.parent.filename} / {selectedSource.path}</p>}
+                            {!selectedSource && attachmentDescription(attachment) && <p className="muted break-word">原文件名 · {attachment.filename}</p>}
                             <InvoiceRecognition data={attachment.parsed_data} />
                             {selectedPackage ? <section aria-label="包内文件">
                               {selectedPackage.members.length > 0 && <ul>
-                                {selectedPackage.members.map((member) => <li key={member.attachment_id}>
-                                  <Button type="link" onClick={() => setSelectedAttachment(member.attachment_id)}
-                                    style={{ whiteSpace: "normal", height: "auto" }}>{member.path}</Button>
-                                </li>)}
+                                {selectedPackage.members.map((member) => {
+                                  const description = attachmentDescription(attachmentsById.get(member.attachment_id));
+                                  return <li key={member.attachment_id}>
+                                    <Button type="link" onClick={() => setSelectedAttachment(member.attachment_id)}
+                                      title={description ? member.path : undefined} style={{ whiteSpace: "normal", height: "auto" }}>
+                                      {description || member.path}
+                                    </Button>
+                                  </li>;
+                                })}
                               </ul>}
                             </section> : <InvoicePreview attachment={attachment} reference={referenceMember} />}
                             {row.business_type === "PAYMENT" && (attachment.mime === "application/pdf" || attachment.mime.startsWith("image/")) && <MaterialText attachment={attachment} />}

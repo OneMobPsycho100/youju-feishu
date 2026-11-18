@@ -1,4 +1,4 @@
-"""共用的原件图像预处理。整份附件校验后才可向识别服务发送图像。"""
+"""分类只准备首页缩略图；票面识别另行校验并准备完整原件图像。"""
 import base64
 import io
 from contextlib import closing
@@ -12,6 +12,8 @@ MAX_PAGES = 10
 MAX_PIXELS = 40_000_000
 MODEL_IMAGE_LIMIT = 12 * 1024 * 1024
 OCR_SAMPLE_LIMIT = 10 * 1024 * 1024
+CLASSIFICATION_IMAGE_EDGE = 1024
+CLASSIFICATION_IMAGE_QUALITY = 75
 _pdf_lock = Lock()
 
 
@@ -26,17 +28,53 @@ class InvoiceImage:
     data: str = field(repr=False)
 
 
-def _encode_page(image: Image.Image) -> InvoiceImage:
+def _encode_page(image: Image.Image, *, max_edge: int = 2048, quality: int = 90) -> InvoiceImage:
     if image.width * image.height > MAX_PIXELS:
         raise ParseRejected("图片超过 4000 万像素，请缩小原件后重新提交")
     with ImageOps.exif_transpose(image) as oriented:
-        oriented.thumbnail((2048, 2048))
+        oriented.thumbnail((max_edge, max_edge))
         # 白底 JPEG 支持透明图片和 TIFF 等不同原件格式，同时去掉原件元数据。
         with oriented.convert("RGBA") as rgba, Image.new("RGB", oriented.size, "white") as canvas:
             with rgba.getchannel("A") as alpha, io.BytesIO() as stream:
                 canvas.paste(rgba, mask=alpha)
-                canvas.save(stream, format="JPEG", quality=90, optimize=True)
+                canvas.save(stream, format="JPEG", quality=quality, optimize=True)
                 return InvoiceImage(canvas.width, canvas.height, base64.b64encode(stream.getvalue()).decode("ascii"))
+
+
+def classification_first_page(path: Path, suffix: str) -> InvoiceImage:
+    """只解码 PDF 首页或图片首帧，返回最长边 1024、质量 75 的 JPEG。
+
+    分类不受票面识别的十页上限约束，也不创建后续页图像。返回值不能用于高清票面补读。
+    空白首页直接交人工确认，避免模型把没有分类依据的页面判为普通附件。
+    """
+    def encode(image: Image.Image) -> InvoiceImage:
+        page = _encode_page(image, max_edge=CLASSIFICATION_IMAGE_EDGE, quality=CLASSIFICATION_IMAGE_QUALITY)
+        with io.BytesIO(base64.b64decode(page.data)) as stream, Image.open(stream) as preview:
+            with preview.convert("L") as gray:
+                low, high = gray.getextrema()
+                if high - low <= 2:
+                    raise ParseRejected("附件首页为空白，请核对原件或人工确认类别")
+        return page
+
+    if suffix == ".pdf":
+        import pypdfium2 as pdfium
+        # 与票面渲染共用 PDFium 锁；只访问第 0 页，网络请求在释放锁后执行。
+        with _pdf_lock, closing(pdfium.PdfDocument(str(path))) as doc:
+            if not len(doc):
+                raise ParseRejected("PDF 没有可读取的首页，请核对原件")
+            with closing(doc[0]) as page:
+                width, height = page.get_size()
+                if width <= 0 or height <= 0 or width * height * 4 > MAX_PIXELS:
+                    raise ParseRejected("PDF 首页尺寸异常或超过 4000 万像素")
+                with closing(page.render(scale=min(2, CLASSIFICATION_IMAGE_EDGE / max(width, height)))) as bitmap:
+                    with bitmap.to_pil() as image:
+                        return encode(image)
+    try:
+        with Image.open(path) as image:
+            image.seek(0)
+            return encode(image)
+    except Image.DecompressionBombError as exc:
+        raise ParseRejected("图片超过 4000 万像素，请缩小原件后重新提交") from exc
 
 
 def invoice_page_images(path: Path, suffix: str) -> list[InvoiceImage]:

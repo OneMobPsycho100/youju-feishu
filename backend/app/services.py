@@ -2,12 +2,13 @@
 import copy
 import hashlib
 import json
+import logging
 import re
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from urllib.parse import quote
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from .config import settings
 from .db import begin_write
@@ -40,6 +41,7 @@ from .reference_pdfs import enqueue_reference_pdfs, reference_approval, referenc
 
 PARTIAL_CONTRACT_EVIDENCE = "MATERIAL_PARTIAL"
 ACTIVE_ACTION_STATUSES = ("REQUESTED", "EXECUTING", "UNKNOWN")
+logger = logging.getLogger(__name__)
 
 
 def log(db, actor: str, action: str, target: str, detail: dict | None = None):
@@ -375,11 +377,16 @@ def update_capability(template, key: str, value=True):
     template.capabilities = {**(template.capabilities or {}), key: value}
 
 
-def sync_instance(db, instance_code: str, template_code: str | None = None) -> Approval:
-    """先下载完整原件，再校验读取期间的版本；同步状态与附件集合在一个短事务中提交。"""
+def sync_instance(db, instance_code: str, template_code: str | None = None, *, snapshot: dict | None = None) -> Approval:
+    """先下载完整原件，再校验版本并在短事务中提交。
+
+    snapshot 仅供内部调用方复用本轮已从飞书读取、完成范围校验的详情；未传入时实时读取。
+    七天及归档限制由补偿入口负责，事件、人工刷新和归档调用不受限制。
+    """
     db.rollback()
     remote = gateway(db)
-    snapshot = remote.get_instance(instance_code)
+    if snapshot is None:
+        snapshot = remote.get_instance(instance_code)
     code = snapshot.get("approval_code") or template_code
     template = db.get(ApprovalTemplate, code)
     if not template or not template.active:
@@ -1485,23 +1492,63 @@ def handle_event(db, event_id: str) -> dict:
     return result
 
 
+def _compensation_skip_reason(approval: Approval | None, start: datetime, end: datetime) -> str:
+    """补偿专用的本地预筛选；提交时间未知时留给飞书详情确认，不能用采集时间代替。"""
+    if approval is not None:
+        if approval.archive_status == "ARCHIVED":
+            return "archived"
+        if approval.submitted_at is not None and not start <= approval.submitted_at <= end:
+            return "outside_window"
+    return ""
+
+
 def sync_all(db) -> dict:
+    """自动、手动补偿只同步近七天提交且未完成归档的审批，返回实际同步数量。"""
+    from .reimbursement_metadata import snapshot_metadata
+
     remote, count = FeishuGateway(), 0
+    # 整轮使用同一 UTC 时间边界；游标积压也不再扫描七天以前提交的审批。
+    window_end = now()
+    window_start = window_end - timedelta(days=7)
     template_codes = list(db.scalars(select(ApprovalTemplate.code).where(ApprovalTemplate.active.is_(True))))
     for template_code in template_codes:
         template = db.get(ApprovalTemplate, template_code)
-        start = (template.sync_cursor or template.created_at) - timedelta(minutes=5)
-        end = min(now(), start + timedelta(days=1))
+        anchor = min(template.sync_cursor or template.created_at, window_end)
+        start = max(window_start, anchor - timedelta(minutes=5))
+        end = min(window_end, start + timedelta(days=1))
         db.rollback()
         codes = remote.list_instances(template_code, int(start.replace(tzinfo=timezone.utc).timestamp()*1000),
                                       int(end.replace(tzinfo=timezone.utc).timestamp()*1000))
-        # 发起时间筛选无法覆盖旧审批的新终态；按上次读取时间补偿存量实例。
+        # 先过滤再限额，避免已归档或过期审批占用补偿名额；未知提交时间只允许先核实详情。
         for statuses in (("PENDING",), ("APPROVED", "REVERTED")):
             codes.extend(db.scalars(select(Approval.id).where(Approval.template_code == template_code,
-                Approval.status.in_(statuses)).order_by(Approval.last_synced_at).limit(100)).all())
+                Approval.status.in_(statuses), Approval.archive_status != "ARCHIVED",
+                or_(Approval.submitted_at.is_(None), Approval.submitted_at.between(window_start, window_end)))
+                .order_by(Approval.last_synced_at).limit(100)).all())
         db.rollback()
         for code in dict.fromkeys(codes):
-            approval = sync_instance(db, code, template_code)
+            reason = _compensation_skip_reason(db.get(Approval, code), window_start, window_end)
+            db.rollback()
+            if reason:
+                logger.info("compensation_skip instance_code=%s reason=%s", code, reason)
+                continue
+            # 新发现或历史时间缺失的实例，须先按权威提交时间校验；过滤发生在附件下载前。
+            snapshot = remote.get_instance(code)
+            submitted_at = snapshot_metadata(snapshot).get("submitted_at")
+            if submitted_at is None:
+                logger.warning("compensation_skip instance_code=%s reason=missing_submitted_at", code)
+                continue
+            if not window_start <= submitted_at <= window_end:
+                logger.info("compensation_skip instance_code=%s reason=outside_window", code)
+                continue
+            # 飞书请求期间可能已有事件完成归档，重新读取，不能沿用请求前的本地快照。
+            db.rollback()
+            reason = _compensation_skip_reason(db.get(Approval, code), window_start, window_end)
+            db.rollback()
+            if reason:
+                logger.info("compensation_skip instance_code=%s reason=%s", code, reason)
+                continue
+            approval = sync_instance(db, code, template_code, snapshot=snapshot)
             begin_write(db)
             if approval.status == "APPROVED":
                 enqueue(db, "ARCHIVE", {"instance_code": code}, f"compensation:archive:{code}:{approval.attachment_version}")

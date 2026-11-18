@@ -31,12 +31,15 @@ export function recognitionLabel(data: ParsedData): string {
 export function InvoiceRecognition({ data }: { data: ParsedData }) {
   if (data.archive) return null;
   const classification = data.classification;
+  const firstPage = classification?.scope === "FIRST_PAGE";
+  const classificationLabel = classification?.source === "LOCAL" ? "本地分类"
+    : classification?.source === "MANUAL" ? "人工分类" : firstPage ? "首页 AI 分类" : "模型内容分类";
   const classificationEvidence = classification && <div className="invoice-classification">
-    <strong>{classification.source === "MANUAL" ? "人工分类" : "模型内容分类"}{classification.cached ? " · 已复用" : ""}</strong>
+    <strong>{classificationLabel}{classification.cached ? " · 已复用" : ""}</strong>
     <p>{classification.reason}</p>
-    {!!classification.pages.length && <small>已检查第 {classification.pages.join("、")} 页
-      {classification.invoice_pages.length > 0 && `；发票位于第 ${classification.invoice_pages.join("、")} 页`}
-      {`；不同发票 ${classification.invoice_count} 张`}</small>}
+    {!!classification.pages.length && <small>{firstPage ? "分类依据：首页" : `分类依据：第 ${classification.pages.join("、")} 页`}
+      {!!classification.invoice_pages?.length && `；发票位于第 ${classification.invoice_pages.join("、")} 页`}
+      {classification.invoice_count != null && `；不同发票 ${classification.invoice_count} 张`}</small>}
   </div>;
   if (data.parse_status === "SKIPPED" || !data.recognition) return classificationEvidence || <Typography.Paragraph type="secondary">{data.skip_reason}</Typography.Paragraph>;
   const sources = Object.entries(data.sources || {});

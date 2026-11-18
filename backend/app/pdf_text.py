@@ -50,3 +50,11 @@ def read_pdf_segments(path: Path, *, max_text: int | None = None) -> list[dict[s
     with path.open("rb") as stream:
         reader = PdfReader(stream)
         return read_pdf_pages(reader, stop=pdf_text_page_count(reader), max_text=max_text)
+
+
+def read_pdf_first_page(path: Path, *, max_text: int = 60000) -> str:
+    """分类专用的首页文字读取；校验文件可读性，但不限制总页数或提取后续页。"""
+    with path.open("rb") as stream:
+        reader = PdfReader(stream)
+        pdf_text_page_count(reader, allow_long=True)
+        return read_pdf_pages(reader, stop=1, max_text=max_text)[0]["text"]

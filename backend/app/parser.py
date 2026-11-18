@@ -280,36 +280,44 @@ def parse_with_fallback(path: Path, config, *, ocr_config: "OCRConfigSnapshot", 
                         template_code: str, parent_db,
                         sha256: str = "", previous: dict | None = None, local_result: dict | None = None,
                         agent_conversation_id: str | None = None, before_request: Callable[[], None] | None = None) -> dict:
-    """分类是发票规则的前置条件；分类与补读共用一次独立模型结果。
+    """先分类再按需识别票面；首页分类不承担字段提取、多票或正文完整性校验。
 
-    PDF 的本地字段保持单独缓存。分类模型不参与完整本地字段的重复投票；
-    图片 OCR 完整时直接采用，只有缺项时才使用分类请求附带的清晰候选。
+    PDF 本地字段完整时不调用票面模型；图片 OCR 完整时不调用模型补读。
+    高清图像仅在票面识别需要时创建，不能复用分类阶段的低分辨率首页。
     """
-    from .document_classification import classify_document
+    from .document_classification import LEGACY_CLASSIFICATION_VERSION, classify_document
+    from .invoice_recognition import recognition_cache_valid
     previous = previous or {}
     sha256 = sha256 or hashlib.sha256(path.read_bytes()).hexdigest()
     suffix, _ = detect_file_type(path.read_bytes(), path.name)
     if previous.get("confirmed") and not previous.get("error"):
         return {**copy.deepcopy(previous), "material_type": "INVOICE", "parse_status": "PARSED"}
-    if suffix not in {".pdf", *IMAGE_SUFFIXES}:
-        result = copy.deepcopy(local_result) if local_result is not None else parse(path)
-        result["cache_key"] = recognition_cache_key(sha256, config, ocr_version=ocr_config.recognition_version, file_type=suffix)
-        return result
-    classification, pages = classify_document(path, config, sha256=sha256, file_type=suffix,
+    if recognition_cache_valid(previous, sha256, config, ocr_version=ocr_config.recognition_version):
+        cached = copy.deepcopy(previous)
+        if cached.get("classification"):
+            cached["classification"]["cached"] = True
+        return cached
+    if suffix in {".pdf", *IMAGE_SUFFIXES}:
+        from .recognition_cache import has_manual_recognition, reusable_automatic_recognition
+        if not has_manual_recognition(previous):
+            cached = reusable_automatic_recognition(parent_db, approval_id, sha256, suffix, config,
+                ocr_version=ocr_config.recognition_version)
+            if cached is not None:
+                # 来源序号改变不影响文件内容。只复用自动证据，当前附件自己的付款材料仍独立校验。
+                if previous.get("material"):
+                    cached["material"] = copy.deepcopy(previous["material"])
+                if cached.get("classification"):
+                    cached["classification"]["cached"] = True
+                return cached
+    classification = classify_document(path, config, sha256=sha256, file_type=suffix,
         approval_id=approval_id, template_code=template_code, parent_db=parent_db, previous=previous,
         agent_conversation_id=agent_conversation_id, before_request=before_request)
-    # 即使此前字段不完整，仍可复用同原件、同解析器的 PDF 本地候选，模型配置只影响分类。
-    cached_text = previous.get("sources", {}).get("TEXT")
-    if suffix == ".pdf" and cached_text and previous.get("pdf_parser_version") == PDF_TEXT_VERSION and previous.get("file_type") == suffix:
-        result = {"source": "TEXT", "sources": {"TEXT": copy.deepcopy(cached_text)},
-            "raw_text": cached_text.get("raw_text", ""), "confirmed": False, "error": "", "file_type": suffix,
-            "pipeline_version": PIPELINE_VERSION, "pdf_parser_version": PDF_TEXT_VERSION}
-        result["recognition"] = compare_sources(result["sources"], local_pdf=True)
-        result = _finalize(result)
-    else:
-        result = copy.deepcopy(local_result) if local_result is not None else parse(path)
-    result.update(classification=classification, material_type=classification["material_type"],
-                  document_policy_version=DOCUMENT_RECOGNITION_VERSION)
+    # 非发票和待确认材料不进入 parse()，防止为分类预先读取整份 PDF、渲染全部页面。
+    result = {"source": "TEXT" if suffix == ".pdf" else TENCENT_OCR if suffix in IMAGE_SUFFIXES else suffix[1:].upper(),
+              "sources": {}, "fields": {}, "raw_text": "", "file_type": suffix,
+              "confirmed": False, "error": "", "reliable": False, "pipeline_version": PIPELINE_VERSION,
+              "classification": classification, "material_type": classification["material_type"],
+              "document_policy_version": DOCUMENT_RECOGNITION_VERSION}
     if previous.get("material"):
         result["material"] = copy.deepcopy(previous["material"])
 
@@ -323,71 +331,109 @@ def parse_with_fallback(path: Path, config, *, ocr_config: "OCRConfigSnapshot", 
     if classification.get("status") != "COMPLETED" or not classification.get("complete"):
         return uncertain(classification["reason"])
     if classification["material_type"] != "INVOICE":
+        # 已有可信票面与新类别冲突时仍交人工；不为这项核对重新解析普通附件全文。
         prior_ocr = previous.get("sources", {}).get(TENCENT_OCR, {})
         prior_fields = prior_ocr.get("fields") or {}
-        positive = (suffix == ".pdf" and result.get("recognition", {}).get("status") == "LOCAL") or (
+        prior_text = previous.get("sources", {}).get("TEXT") or {}
+        positive = (suffix == ".pdf" and previous.get("pdf_parser_version") == PDF_TEXT_VERSION
+                    and compare_sources({"TEXT": prior_text}, local_pdf=True)["status"] == "LOCAL") or (
             prior_ocr.get("status") == "COMPLETED" and normalized_candidate("number", prior_fields.get("number"))
             and normalized_candidate("amount", prior_fields.get("amount")))
         if positive and classification.get("source") != "MANUAL":
-            result["classification"] = {**classification, "status": "UNKNOWN", "complete": False,
+            result["classification"] = {**classification, "status": "UNKNOWN", "complete": False, "description": None,
                 "material_type": "UNKNOWN", "reason": "材料分类与已有有效票面字段矛盾，请人工核对原件"}
             return uncertain(result["classification"]["reason"])
-        result.update(parse_status="SKIPPED", fields={}, sources={}, error="", reliable=False,
-                      rejected=False, recognition=None, skip_reason=classification["reason"], fallback_allowed=False)
+        result.update(parse_status="SKIPPED", recognition=None, skip_reason=classification["reason"],
+                      fallback_allowed=False, rejected=False)
         result["cache_key"] = recognition_cache_key(sha256, config, ocr_version=ocr_config.recognition_version, file_type=suffix)
         return result
-    if classification.get("invoice_count") != 1:
-        return uncertain("同一附件包含多张不同发票，请拆分为独立原件后重新提交", rejected=True)
+
+    # 只有确认是发票才读取完整票面。既有本地字段缓存仍独立于分类模型配置。
+    cached_text = previous.get("sources", {}).get("TEXT")
+    if (suffix == ".pdf" and cached_text and previous.get("pdf_parser_version") == PDF_TEXT_VERSION
+            and previous.get("file_type") == suffix):
+        local = {"source": "TEXT", "sources": {"TEXT": copy.deepcopy(cached_text)},
+            "raw_text": cached_text.get("raw_text", ""), "confirmed": False, "error": "", "file_type": suffix,
+            "pipeline_version": PIPELINE_VERSION, "pdf_parser_version": PDF_TEXT_VERSION}
+        local["recognition"] = compare_sources(local["sources"], local_pdf=True)
+        local = _finalize(local)
+    else:
+        local = copy.deepcopy(local_result) if local_result is not None else parse(path)
+    result.update(local)
+    result.update(classification=classification, material_type="INVOICE",
+                  document_policy_version=DOCUMENT_RECOGNITION_VERSION)
     if result.get("rejected"):
+        return uncertain(result["error"], rejected=True)
+    if suffix in {".xml", ".ofd"}:
+        # XML 的字段条件和 OFD 的人工核对规则沿用原策略，分类成功不代表字段合格。
+        result["parse_status"] = "PARSED"
+        result["cache_key"] = recognition_cache_key(sha256, config, ocr_version=ocr_config.recognition_version, file_type=suffix)
         return result
-    model_source = {"status": "COMPLETED", "fields": classification.get("fields", {}),
-                    "clear_fields": classification.get("clear_fields", {}), "error": "",
-                    "cached": bool(classification.get("cached"))}
+
+    pages = None
+
+    def full_page_images():
+        nonlocal pages
+        if pages is None:
+            try:
+                pages = invoice_page_images(path, suffix)
+            except ParseRejected:
+                raise
+            except Exception as exc:
+                raise ParseRejected("原件页面无法完整读取，请核对文件") from exc
+        return pages
+
     def fallback_model():
-        """人工只确认类别时，必要的票面补读仍需独立调用；分类确认不代表字段已确认。"""
-        if classification.get("source") != "MANUAL" or model_source["fields"]:
-            return model_source
+        """仅在票面字段不完整时独立补读；兼容复用旧全页分类留下的高清字段证据。"""
+        if (classification.get("version") == LEGACY_CLASSIFICATION_VERSION
+                and classification.get("invoice_count") == 1 and classification.get("fields")):
+            result["model_call_id"] = classification.get("model_call_id", "")
+            return {"status": "COMPLETED", "fields": classification["fields"],
+                    "clear_fields": classification.get("clear_fields", {}), "error": "", "cached": True}
         from .agent_runtime import INVOICE_EXTRACTION_PROMPT, INVOICE_EXTRACTION_CONSTRAINTS, extract_invoice
         from .ai_logs import AICallRecorder
+        images = model_image_blocks(full_page_images())
         trace = AICallRecorder(config, source="AGENT_ATTACHMENT" if agent_conversation_id else "INVOICE_EXTRACTION",
             prompt=INVOICE_EXTRACTION_PROMPT, constraints=INVOICE_EXTRACTION_CONSTRAINTS, approval_id=approval_id,
             template_code=template_code, parent_db=parent_db, agent_conversation_id=agent_conversation_id)
-        images = model_image_blocks(pages if pages is not None else invoice_page_images(path, suffix))
         read = extract_invoice(config, images, trace=trace, before_request=before_request)
         result["model_call_id"] = trace.id
         return {"status": read["status"], "fields": read.get("fields", {}), "clear_fields": read.get("clear_fields", {}),
+                "rejected": bool(read.get("rejected")),
                 "error": "" if read["status"] == "COMPLETED" else read.get("summary", "票面补读未完成")}
+
     pdf_model = suffix == ".pdf" and result.get("recognition", {}).get("status") != "LOCAL"
     result["cache_key"] = recognition_cache_key(sha256, config, ocr_version=ocr_config.recognition_version,
         file_type=suffix, pdf_model=pdf_model)
-    if suffix == ".pdf":
-        if pdf_model:
-            result["sources"]["MODEL"] = fallback_model()
-            result.setdefault("model_call_id", classification["model_call_id"])
-        result["recognition"] = compare_sources(result["sources"], local_pdf=True)
-    else:
-        if ocr_config.configured:
-            from .tencent_invoice_ocr import recognize_invoice
-            try:
-                if pages is None:
-                    pages = invoice_page_images(path, suffix)
+    try:
+        if suffix == ".pdf":
+            if pdf_model:
+                result["sources"]["MODEL"] = fallback_model()
+                if result["sources"]["MODEL"].get("rejected"):
+                    return uncertain(result["sources"]["MODEL"]["error"], rejected=True)
+            result["recognition"] = compare_sources(result["sources"], local_pdf=True)
+        else:
+            if ocr_config.configured:
+                from .tencent_invoice_ocr import recognize_invoice
+                images = full_page_images()
                 if before_request:
                     before_request()
-                ocr_source = recognize_invoice(pages, ocr_config)
-            except ParseRejected as exc:
-                return uncertain(str(exc), rejected=True)
-        else:
-            ocr_source = {"status": "FAILED" if ocr_config.enabled else "SKIPPED", "fields": {},
-                "error": (ocr_config.credential_error or "缺少腾讯云 OCR 凭据") if ocr_config.enabled else "腾讯云发票 OCR 未启用"}
-        result["sources"][TENCENT_OCR] = ocr_source
-        result["raw_text"] = ocr_source.get("raw_text", "")
-        if ocr_source.get("rejected"):
-            return uncertain(ocr_source["error"], rejected=True)
-        result["recognition"] = compare_image_sources(result["sources"])
-        if result["recognition"]["status"] != "OCR":
-            result["sources"]["MODEL"] = fallback_model()
-            result.setdefault("model_call_id", classification["model_call_id"])
+                ocr_source = recognize_invoice(images, ocr_config)
+            else:
+                ocr_source = {"status": "FAILED" if ocr_config.enabled else "SKIPPED", "fields": {},
+                    "error": (ocr_config.credential_error or "缺少腾讯云 OCR 凭据") if ocr_config.enabled else "腾讯云发票 OCR 未启用"}
+            result["sources"][TENCENT_OCR] = ocr_source
+            result["raw_text"] = ocr_source.get("raw_text", "")
+            if ocr_source.get("rejected"):
+                return uncertain(ocr_source["error"], rejected=True)
             result["recognition"] = compare_image_sources(result["sources"])
+            if result["recognition"]["status"] != "OCR":
+                result["sources"]["MODEL"] = fallback_model()
+                if result["sources"]["MODEL"].get("rejected"):
+                    return uncertain(result["sources"]["MODEL"]["error"], rejected=True)
+                result["recognition"] = compare_image_sources(result["sources"])
+    except ParseRejected as exc:
+        return uncertain(str(exc), rejected=True)
     result["reliable"] = result["recognition"]["status"] in {"LOCAL", "OCR"}
     result["parse_status"] = "PARSED"
     return _finalize(result)

@@ -331,18 +331,22 @@ class AttachmentArchiveOut(Schema):
 
 
 class DocumentClassificationOut(Schema):
-    """整份附件分类证据；不暴露分类请求中的内部票面候选，不作为重复字段计票。"""
+    """附件类别及判断范围；分类确定不表示正文完整或票面字段已校验。"""
     status: Literal["COMPLETED", "UNKNOWN", "FAILED"] = Field(description="分类完成、内容不确定或分类调用失败")
     material_type: Literal["INVOICE", "CONTRACT", "QUOTE", "OTHER", "UNKNOWN"] = Field(description="原件实际内容类别")
-    complete: bool = Field(description="模型已完整检查全部页面，或财务已明确确认当前原件")
+    complete: bool = Field(description="是否已确定附件类别；与正文完整性、票面字段校验相互独立")
     reason: str = Field(description="分类依据或未完成原因")
-    source: Literal["MODEL", "MANUAL"] = Field(description="模型分类或绑定当前原件的人工确认")
-    pages: list[int] = Field(default_factory=list, description="模型完整检查的页码；人工确认可为空")
-    invoice_pages: list[int] = Field(default_factory=list, description="实际包含发票票面的页码")
-    invoice_count: int = Field(description="不同发票数量；同票跨页只计一次")
+    description: str | None = Field(
+        None, description="自动命名附件可展示的简短中文描述，可带明示人民币金额；缺少可靠描述或旧结果时为空")
+    source: Literal["LOCAL", "MODEL", "MANUAL"] = Field(description="本地规则、首页模型或绑定当前原件的人工确认")
+    scope: Literal["FIRST_PAGE", "FULL_DOCUMENT"] = Field(
+        "FULL_DOCUMENT", description="分类依据范围：首页或完整原件；旧全页分类默认 FULL_DOCUMENT，不代表正文读取状态")
+    pages: list[int] = Field(default_factory=list, description="实际用于分类的页码；首页分类为 [1]，结构化及人工确认可为空")
+    invoice_pages: list[int] | None = Field(None, description="已知发票所在页；首页分类不探查全部票页，未知时为空")
+    invoice_count: int | None = Field(None, description="已知不同发票数量；首页分类不计数，未知时为空且不作为分类完成条件")
     version: str = Field(description="分类策略版本")
-    model_call_id: str = Field("", description="分类模型调用日志 ID；人工确认时为空")
-    cached: bool = Field(False, description="是否复用同一原件及模型配置下的完整分类")
+    model_call_id: str = Field("", description="分类模型调用日志 ID；本地判断或人工确认时为空")
+    cached: bool = Field(False, description="是否复用有效分类；本地分类不受模型连接配置变化影响")
 
 
 class ParsedInvoiceDataOut(Schema):
@@ -365,7 +369,7 @@ class ParsedInvoiceDataOut(Schema):
     sources: dict[str, RecognitionSourceOut] = Field(default_factory=dict, description="各个独立来源的候选及失败原因")
     recognition: RecognitionOut | None = Field(None, description="本地解析或交叉核对结论；旧记录可能尚无识别结论")
     material_type: Literal["INVOICE", "CONTRACT", "QUOTE", "OTHER", "UNKNOWN"] = Field("INVOICE", description="附件内容分类；历史未分类记录兼容原默认值")
-    classification: DocumentClassificationOut | None = Field(None, description="PDF、图片整份分类证据；旧记录和结构化原件可为空")
+    classification: DocumentClassificationOut | None = Field(None, description="本地或首页类别判断证据；旧记录可为空，不代表正文已完整读取")
     document_policy_version: str = Field("", description="PDF、图片分类及字段采用策略版本")
     material: PaymentMaterialOut = Field(default_factory=dict, description="付款材料完整读取状态、定位文本片段、阅读范围和分类依据")
     archive: AttachmentArchiveOut | None = Field(None, description="仅压缩包原件返回，含展开状态、用途和包内文件")

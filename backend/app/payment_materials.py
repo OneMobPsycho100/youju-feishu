@@ -4,7 +4,6 @@ import hashlib
 import json
 import re
 import zipfile
-from contextlib import closing
 from pathlib import Path
 from typing import Callable, Literal
 
@@ -16,20 +15,17 @@ from .agent_runtime import _run_structured_model
 from .ai_logs import AICallRecorder
 from .audit_policy import PAYMENT_PDF_POLICY_VERSION
 from .errors import StaleSnapshotError
+from .document_classification import classify_first_page_text
 from .invoice_recognition import recognition_cache_key
 from .invoice_images import invoice_images
-from .pdf_text import pdf_text_page_count, read_pdf_pages
+from .pdf_text import PdfTextMissing, pdf_text_page_count, read_pdf_pages
 
 MATERIAL_VERSION = "payment-materials-v2"
 CONTRACT_READ_PAGES = 5
 MAX_TEXT = 60000
 MAX_SEGMENTS = 2000
-INVOICE_NUMBER = re.compile(r"(?:发票号码|发票代码|电子发票号码|Invoice(?:Number|No|Code))[:：]*\d{8,20}", re.I)
-PDF_INVOICE_HEADING = re.compile(r"电子发票|数电(?:发票|票)|增值税(?:电子)?(?:专用|普通)发票")
-CONTRACT_TITLE = re.compile(r".{0,50}(?:合同|协议)(?:书)?(?:[（(][^）)]{1,20}[）)])?")
 MATERIAL_PROMPT = (
-    "你是付款材料阅读助手。完整阅读原件，区分发票(INVOICE)、合同(CONTRACT)、报价单(QUOTE)、其他(OTHER)或无法判断(UNKNOWN)。"
-    "含有实际发票票面或附带发票页时归为 INVOICE，不能因合同中提到将来开票就判为发票。"
+    "你是材料正文阅读助手。附件已通过独立入口完成分类，material_type 必须沿用输入类别，不重新分类。"
     "文字材料的 segments 已提供定位，禁止修改或补写原文。图像材料请逐页提取可辨认的完整正文，location 使用页码。"
     "任何一页缺失、模糊或无法完整读出关键付款约定时 complete=false。不得根据文件名猜测事实。"
 )
@@ -43,8 +39,8 @@ MATERIAL_CONSTRAINTS = (
 
 class MaterialReading(BaseModel):
     """模型仅提交材料事实；是否允许同意仍由模板业务条件和执行约束决定。"""
-    material_type: Literal["INVOICE", "CONTRACT", "QUOTE", "OTHER", "UNKNOWN"]
-    complete: bool
+    material_type: Literal["INVOICE", "CONTRACT", "QUOTE", "OTHER", "UNKNOWN"] = Field(description="沿用输入中已确定的材料类别")
+    complete: bool = Field(description="是否完整读取提供的正文页面，独立于附件类别是否已确定")
     summary: str = Field(min_length=1, max_length=2000)
     segments: list[dict[str, str]] = Field(default_factory=list, max_length=MAX_SEGMENTS)
 
@@ -117,40 +113,27 @@ def _excel_segments(path: Path) -> list[dict]:
         cached.close()
 
 
-def read_office_segments(path: Path) -> list[dict]:
+def read_office_segments(path: Path, *, file_type: str | None = None) -> list[dict]:
     """共享 Office 只读提取；保留段落／单元格定位及原有完整性、解压大小限制。"""
-    if path.suffix.lower() == ".docx":
+    suffix = file_type or path.suffix.lower()
+    if suffix == ".docx":
         return _word_segments(path)
-    if path.suffix.lower() == ".xlsx":
+    if suffix == ".xlsx":
         return _excel_segments(path)
     raise ValueError("仅支持 DOCX 或 XLSX 文档")
 
 
-def _read_local(path: Path) -> tuple[list[dict], list[dict]]:
-    suffix = path.suffix.lower()
+def _read_local(path: Path, suffix: str) -> tuple[list[dict], list[dict]]:
     if suffix in {".docx", ".xlsx"}:
-        return read_office_segments(path), []
+        return read_office_segments(path, file_type=suffix), []
     if suffix in {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff"}:
         return [], invoice_images(path, suffix)
     raise ValueError("此材料格式暂不支持自动读取，请提供 PDF、图片、docx 或 xlsx，或由财务人工核对")
 
 
 def _pdf_kind(segments: list[dict[str, str]]) -> str:
-    """票面和报价特征优先；合同只依据前五页的标题或签约双方信息判定。"""
-    pages = [re.sub(r"\s+", "", segment["text"]) for segment in segments]
-    text = "\n".join(pages)
-    if INVOICE_NUMBER.search(text) or any(PDF_INVOICE_HEADING.match(page) for page in pages):
-        return "INVOICE"
-    if re.search("报价单|报价明细|报价表", text[:1000]):
-        return "QUOTE"
-
-    # 标题必须独立成行。正文中的合同编号或引用不足以判断文件本身是合同。
-    first_lines = [re.sub(r"\s+", "", line) for line in segments[0]["text"].splitlines() if line.strip()]
-    prefix = "\n".join(pages[:CONTRACT_READ_PAGES])
-    if any(CONTRACT_TITLE.fullmatch(line) for line in first_lines[:8]) or (
-            re.search("合同|协议", prefix[:1000]) and "甲方" in prefix and "乙方" in prefix):
-        return "CONTRACT"
-    return "OTHER"
+    """复用首页规则，正文后续出现“发票”等关键词不改变附件类别。"""
+    return classify_first_page_text(segments[0]["text"])[0] if segments else "UNKNOWN"
 
 
 def _read_payment_pdf(path: Path, confirmed_kind: str) -> tuple[list[dict[str, str]], str, bool, int]:
@@ -172,16 +155,16 @@ def _read_payment_pdf(path: Path, confirmed_kind: str) -> tuple[list[dict[str, s
 def read_payment_material(path: Path, config, *, sha256: str, approval_id: str, template_code: str,
                           parent_db, previous: dict | None = None, invoice_linked: bool = False,
                           before_request: Callable[[], None] | None = None, ocr_config=None) -> dict:
-    """PDF、图片共用完整分类与票面入口；普通付款材料另保留正文及限页范围。"""
+    """先复用统一的本地／首页分类，再按业务需要读取正文或识别票面。"""
     from .file_types import IMAGE_SUFFIXES, detect_file_type
     from .invoice_recognition import recognition_cache_valid
     from .ocr_config import load_ocr_config
     from .parser import parse_with_fallback
     suffix, _ = detect_file_type(path.read_bytes(), path.name)
-    if suffix not in {".pdf", *IMAGE_SUFFIXES}:
+    if suffix not in {".pdf", ".xml", ".ofd", *IMAGE_SUFFIXES}:
         return _read_payment_material_body(path, config, sha256=sha256, approval_id=approval_id,
             template_code=template_code, parent_db=parent_db, previous=previous,
-            invoice_linked=invoice_linked, before_request=before_request)
+            invoice_linked=invoice_linked, before_request=before_request, file_type=suffix)
     ocr = ocr_config or load_ocr_config(parent_db)
     previous = previous or {}
     parsed = copy.deepcopy(previous) if recognition_cache_valid(previous, sha256, config, ocr_version=ocr.recognition_version) else parse_with_fallback(
@@ -192,53 +175,53 @@ def read_payment_material(path: Path, config, *, sha256: str, approval_id: str, 
         material.update(complete=True, segments=[], summary="原件已确认为发票，继续按票面字段处理", error="")
         return {**parsed, "material": material}
     if parsed.get("material_type") == "UNKNOWN":
-        # 长合同仍可展示已有前缀，但不把限页阅读当作整份分类完成。
-        if suffix == ".pdf":
-            body = _read_payment_material_body(path, config, sha256=sha256, approval_id=approval_id,
-                template_code=template_code, parent_db=parent_db, previous=previous,
-                invoice_linked=invoice_linked, before_request=before_request)
-            material.update(body.get("material") or {})
+        # 分类失败直接待确认，不借正文读取再发起一次整份图像分类。
         material.update(complete=False, error=parsed.get("error") or "材料类别尚未确认")
         return {**parsed, "material": material}
+    body_previous = {**previous, **parsed, "material": material}
     body = _read_payment_material_body(path, config, sha256=sha256, approval_id=approval_id,
-        template_code=template_code, parent_db=parent_db, previous=previous,
-        invoice_linked=invoice_linked, before_request=before_request)
-    if suffix == ".pdf" and not body.get("material", {}).get("complete") and not body.get("material", {}).get("page_scope"):
-        # 扫描 PDF 的分类已完整读取页面，正文仍需按图像保留，不能把摘要当成完整正文。
+        template_code=template_code, parent_db=parent_db, previous=body_previous,
+        invoice_linked=invoice_linked, before_request=before_request, file_type=suffix)
+    if body.get("material", {}).pop("needs_image_body", False):
+        # 只有正文确实需要图像读取时才准备高清全页，且费用与首页分类独立留痕。
         body = _read_payment_material_body(path, config, sha256=sha256, approval_id=approval_id,
-            template_code=template_code, parent_db=parent_db, previous=previous,
-            invoice_linked=invoice_linked, before_request=before_request, prepared_images=invoice_images(path, suffix))
+            template_code=template_code, parent_db=parent_db, previous=body_previous,
+            invoice_linked=invoice_linked, before_request=before_request, file_type=suffix, image_body=True)
     return {**body, **parsed, "material": body.get("material") or material}
 
 
 def _read_payment_material_body(path: Path, config, *, sha256: str, approval_id: str, template_code: str,
                           parent_db, previous: dict | None = None, invoice_linked: bool = False,
-                          before_request: Callable[[], None] | None = None, prepared_images=None) -> dict:
-    """PDF 仅本地读取与分类，缓存不依赖模型；其他材料保留原有模型读取路径。"""
+                          before_request: Callable[[], None] | None = None, file_type: str | None = None,
+                          image_body: bool = False) -> dict:
+    """按已确定类别读取正文；分类完成不能代替全文完整性或合同限页范围检查。"""
     previous = previous or {}
-    suffix = path.suffix.lower()
+    suffix = file_type or path.suffix.lower()
     material = previous.get("material") or {}
     confirmation = copy.deepcopy(material.get("confirmation"))
     version = MATERIAL_VERSION
     confirmed_kind = (confirmation or {}).get("material_type", "")
+    classification = previous.get("classification") or {}
+    classified_kind = classification.get("material_type", "") if classification.get("complete") else ""
+    known_kind = confirmed_kind or classified_kind
     if suffix == ".pdf":
         # 人工类别与发票关联都可能改变阅读范围；旧结果按新范围重新读取。
         if invoice_linked:
-            confirmed_kind = "INVOICE"
-        version += f":{PAYMENT_PDF_POLICY_VERSION}:{confirmed_kind}"
-    key = hashlib.sha256((version + recognition_cache_key(sha256, config, file_type=suffix)).encode()).hexdigest()
+            known_kind = "INVOICE"
+        version += f":{PAYMENT_PDF_POLICY_VERSION}:{known_kind}"
+        # 已保存的图像正文仍按模型配置复用；纯文字正文不因模型连接变化失效。
+        image_body = image_body or bool(material.get("model_call_id"))
+        if image_body:
+            version += ":image-body"
+    key = hashlib.sha256((version + recognition_cache_key(sha256, config, file_type=suffix, pdf_model=image_body)).encode()).hexdigest()
     if material.get("cache_key") == key and (material.get("complete") or material.get("page_scope")):
         return copy.deepcopy({"material_type": previous["material_type"], "material": material})
     result = {"material_type": "UNKNOWN", "material": {"cache_key": key, "complete": False,
               "segments": [], "summary": "", "error": "", "confirmation": confirmation}}
     target = result["material"]
     try:
-        if suffix in {".xml", ".ofd"}:
-            result["material_type"] = "INVOICE"
-            target.update(complete=True, summary="结构化票据，继续执行发票身份与交叉识别校验")
-            return result
-        if suffix == ".pdf" and prepared_images is None:
-            segments, kind, invoice_suspected, total_pages = _read_payment_pdf(path, confirmed_kind)
+        if suffix == ".pdf" and not image_body:
+            segments, kind, invoice_suspected, total_pages = _read_payment_pdf(path, known_kind)
             result["material_type"] = kind
             target.update(segments=segments, invoice_suspected=invoice_suspected)
             read_pages = len(segments)
@@ -248,32 +231,33 @@ def _read_payment_material_body(path: Path, config, *, sha256: str, approval_id:
             else:
                 target.update(complete=True, summary="财务已确认材料类别，保留完整正文" if confirmation else "PDF 已在本地完整读取")
             return result
-        segments, images = ([], prepared_images) if prepared_images is not None else _read_local(path)
+        segments, images = ([], invoice_images(path, suffix)) if image_body else _read_local(path, suffix)
         if not segments and not images:
             raise ValueError("材料正文为空，无法取得付款依据")
         text = "\n".join(item["text"] for item in segments)
-        compact_text = re.sub(r"\s+", "", text)
-        invoice_suspected = bool(INVOICE_NUMBER.search(compact_text))
-        local_kind = "INVOICE" if invoice_suspected else "QUOTE" if re.search("报价单|报价明细|报价表", text[:1000]) else "CONTRACT" if re.search("合同|协议书|采购协议", text[:1000]) else ""
-        target.update(segments=segments, invoice_suspected=invoice_suspected)
-        if confirmation:
-            local_kind = confirmation["material_type"]
+        local_kind = known_kind
+        if not local_kind and segments:
+            detected, _, _ = classify_first_page_text(text)
+            local_kind = detected if detected in {"CONTRACT", "QUOTE"} else "OTHER"
+        target.update(segments=segments, invoice_suspected=local_kind == "INVOICE")
         if segments and local_kind:
             result["material_type"] = local_kind
             target.update(complete=True, summary="财务已确认材料类别，保留完整正文" if confirmation else "按完整正文及原件类别读取")
             return result
         trace = AICallRecorder(config, source="PAYMENT_MATERIAL", prompt=MATERIAL_PROMPT,
             approval_id=approval_id, template_code=template_code, parent_db=parent_db, constraints=MATERIAL_CONSTRAINTS)
-        def validate(content):
-            reading = MaterialReading.model_validate_json(content)
+        def validate(reading: MaterialReading) -> dict:
+            if reading.material_type != local_kind:
+                raise ValueError("正文阅读不能改变已确定的材料类别")
             return reading.model_dump()
         read = _run_structured_model(config, MATERIAL_PROMPT,
-            {"filename": path.name, "segments": segments, "image_count": len(images)}, validate,
-            constraints=MATERIAL_CONSTRAINTS, trace=trace, images=images or None, before_request=before_request)
+            {"material_type": local_kind, "segments": segments, "image_count": len(images), "task": "材料正文读取"}, validate,
+            output_model=MaterialReading, constraints=MATERIAL_CONSTRAINTS,
+            trace=trace, images=images or None, before_request=before_request)
         target["model_call_id"] = read.get("call_id", "")
         if read["status"] != "COMPLETED":
             raise ValueError(read.get("summary") or "材料识别尚未完成")
-        result["material_type"] = confirmation["material_type"] if confirmation else read["material_type"]
+        result["material_type"] = local_kind
         target["segments"] = _bounded(segments or read.get("segments", []))
         target["summary"] = read["summary"]
         target["complete"] = bool(read["complete"] and target["segments"] and result["material_type"] != "UNKNOWN")
@@ -284,8 +268,10 @@ def _read_payment_material_body(path: Path, config, *, sha256: str, approval_id:
     except Exception as exc:
         # 仅输出本地校验错误；供应商原始异常已由受控运行时转换，不直接泄露到业务界面。
         target["error"] = str(exc)[:400] if isinstance(exc, ValueError) else "材料无法完整读取，请核对原件格式、加密状态及完整性"
-        if confirmed_kind:
-            result["material_type"] = confirmed_kind
+        if isinstance(exc, PdfTextMissing):
+            target["needs_image_body"] = True
+        if known_kind:
+            result["material_type"] = known_kind
     return result
 
 

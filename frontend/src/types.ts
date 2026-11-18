@@ -135,16 +135,25 @@ export interface AttachmentArchive {
 }
 
 export interface ParsedData {
-  /** 整份内容分类独立于字段来源；分类失败不能当作普通附件跳过。 */
+  /** 附件类别判断独立于票面字段和正文读取；分类失败不能当作普通附件跳过。 */
   classification?: {
     status: "COMPLETED" | "UNKNOWN" | "FAILED";
     material_type: MaterialType;
+    /** 仅表示类别已确定，不表示全文已读完或票面校验已通过。 */
     complete: boolean;
     reason: string;
-    source: "MODEL" | "MANUAL";
+    /** 用于自动命名附件的简短描述，可带人民币金额。缺失或为空时展示原名称。 */
+    description?: string | null;
+    /** 本地规则、首页模型或人工确认；旧 MODEL 记录可能使用了完整原件。 */
+    source: "LOCAL" | "MODEL" | "MANUAL";
+    /** 分类依据的范围；旧记录省略时按 FULL_DOCUMENT 展示。 */
+    scope?: "FIRST_PAGE" | "FULL_DOCUMENT";
+    /** 实际参与类别判断的页码，首页分类只包含 1。 */
     pages: number[];
-    invoice_pages: number[];
-    invoice_count: number;
+    /** 首页分类不探查全部发票页，未知时为空。 */
+    invoice_pages?: number[] | null;
+    /** 首页分类不统计发票数量，未知时为空，不参与类别有效性判断。 */
+    invoice_count?: number | null;
     version: string;
     model_call_id?: string;
     cached?: boolean;

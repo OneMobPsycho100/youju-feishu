@@ -798,7 +798,7 @@ def update_sync_config(data: s.SyncConfigInput, user=Depends(admin_user), db=Dep
 
 @app.post("/api/v1/sync", response_model=s.JobOut, tags=["接入配置"], summary="立即发起一次审批增量补偿同步")
 def manual_sync(user=Depends(admin_user), db=Depends(get_db)):
-    """手动同步独立入队，不受自动同步开关和间隔限制。"""
+    """独立入队，不受自动开关和间隔限制；仅补偿近七天提交且未完成归档的审批。"""
     return business.manual_sync(db, user)
 
 

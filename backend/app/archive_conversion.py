@@ -107,7 +107,7 @@ def _run_converter(kind: str, arguments: list[str], work: Path) -> None:
 
 
 def _xlsx_print_tabs(source: Path) -> tuple[int, list[int]] | None:
-    """只读取 OOXML 的打印设置和工作表选择。已定义打印布局时交给 Calc 原样导出。"""
+    """读取默认打印选区。已有打印布局时，由 Calc 读取工作簿的打印范围。"""
     def local_name(name: str) -> str:
         return name.rsplit("}", 1)[-1]
 

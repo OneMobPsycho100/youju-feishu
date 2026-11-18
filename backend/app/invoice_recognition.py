@@ -14,6 +14,7 @@ PIPELINE_VERSION = "pdf-local-image-cross-check-v3"
 # 仅参与 PDF 缓存键，不改变图片识别策略或触发启动时的全量审核失效。
 PDF_TEXT_VERSION = "pdf-text-coordinates-model-fallback-v1"
 TENCENT_OCR = "TENCENT_OCR"
+# 票面字段采用策略保持兼容；首页分类版本由 document_classification 独立管理，避免全量重跑。
 DOCUMENT_RECOGNITION_VERSION = "visual-classification-ocr-primary-v1"
 FIELD_LABELS = {
     "number": "发票号码", "code": "发票代码", "buyer_name": "购买方名称",
@@ -148,8 +149,8 @@ def recognition_passed(result: dict) -> bool:
     """人工确认绑定当前附件；本地解析或交叉核对通过均须使用当前策略版本。"""
     classification = result.get("classification") or {}
     classified = (not result.get("document_policy_version") or
-        (classification.get("complete") and classification.get("material_type") == "INVOICE"
-         and classification.get("invoice_count") == 1))
+        (classification.get("status") == "COMPLETED" and classification.get("complete")
+         and classification.get("material_type") == "INVOICE"))
     return bool(not result.get("error") and (result.get("confirmed") or (classified and
         (result.get("pipeline_version") == PIPELINE_VERSION and
          (result.get("recognition") or {}).get("status") in {"LOCAL", "VERIFIED", "STRUCTURED", "OCR"}))))
@@ -216,12 +217,11 @@ def recognition_cache_valid(result: dict, sha256: str, config, *, ocr_version: i
     if result.get("confirmed") and not result.get("error"):
         return True
     from .file_types import IMAGE_SUFFIXES
-    if result.get("file_type") in {".pdf", *IMAGE_SUFFIXES}:
-        from .document_classification import classification_cache_key
+    if result.get("file_type") in {".pdf", *IMAGE_SUFFIXES} or result.get("classification"):
+        from .document_classification import classification_cache_valid
         classification = result.get("classification") or {}
         if (result.get("document_policy_version") != DOCUMENT_RECOGNITION_VERSION
-                or classification.get("cache_key") != classification_cache_key(sha256, config)
-                or classification.get("status") != "COMPLETED" or not classification.get("complete")):
+                or not classification_cache_valid(classification, sha256, config)):
             return False
     return bool((recognition_passed(result) or result.get("rejected") or result.get("parse_status") == "SKIPPED") and
                 result.get("cache_key") == recognition_cache_key(sha256, config, ocr_version=ocr_version,

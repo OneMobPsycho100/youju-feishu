@@ -119,39 +119,44 @@ def _decode_text(data: bytes) -> str:
     raise ValueError("文本编码无法识别，请使用 UTF-8、UTF-16 或 GB18030 文本")
 
 
-def _image_reading(path, config, conversation_id) -> tuple[list[dict], bool]:
-    """读取图像正文及分类，只有识别为发票的附件才进入发票专用 OCR。"""
+def _image_reading(path, config, conversation_id, *, file_type: str, material_type: str) -> list[dict]:
+    """类别确定后按需读取普通材料正文，不承担分类或发票字段识别。"""
     from .agent_runtime import _run_structured_model
     from .ai_logs import AICallRecorder
     from .invoice_images import invoice_images
     from .payment_materials import MATERIAL_CONSTRAINTS, MATERIAL_PROMPT, MaterialReading
-    images = invoice_images(path, path.suffix.lower())
+    images = invoice_images(path, file_type)
     trace = AICallRecorder(config, source="AGENT_ATTACHMENT", prompt=MATERIAL_PROMPT,
         actor="会话附件解析", constraints=MATERIAL_CONSTRAINTS, agent_conversation_id=conversation_id)
-    result = _run_structured_model(config, MATERIAL_PROMPT, {"image_count": len(images)},
-        lambda content: MaterialReading.model_validate_json(content).model_dump(),
-        constraints=MATERIAL_CONSTRAINTS, trace=trace, images=images)
+    def validate(reading: MaterialReading) -> dict:
+        if reading.material_type != material_type:
+            raise ValueError("正文阅读不能改变已确定的材料类别")
+        return reading.model_dump()
+    result = _run_structured_model(config, MATERIAL_PROMPT,
+        {"task": "材料正文读取", "material_type": material_type, "image_count": len(images)}, validate,
+        output_model=MaterialReading, constraints=MATERIAL_CONSTRAINTS, trace=trace, images=images)
     if result["status"] != "COMPLETED" or not result.get("complete"):
         raise ValueError("图片正文无法完整读取；请提供清晰原件，或检查当前模型是否支持图片")
     segments = result.get("segments") or []
     if not segments or any(set(item) != {"location", "text"} or not all(isinstance(v, str) for v in item.values()) for item in segments):
         raise ValueError("图像读取结果缺少有效的原件定位，请重试或提供文字版文档")
-    return _bounded(segments), result.get("material_type") == "INVOICE"
+    return _bounded(segments)
 
 
 def parse_attachment(path: Path, config, ocr_config: OCRConfigSnapshot, conversation_id: str,
                      sha256: str, previous: dict) -> tuple[list, dict, str]:
-    """PDF 正文本地读取；已识别为发票的缺失字段可使用图像模型兜底。"""
-    from .parser import parse, parse_with_fallback
+    """先完成统一类别判断，再按需读取正文；私人附件仍不建档或占用发票。"""
+    from .invoice_recognition import FIELD_LABELS
+    from .parser import parse_with_fallback
     from .payment_materials import read_office_segments
+    from .pdf_text import PdfTextMissing
 
-    suffix = path.suffix.lower()
-    segments, invoice_result, warning = [], {}, ""
-    suspected, local = False, None
+    suffix, _ = detect_file_type(path.read_bytes(), path.name)
     if suffix in {".docx", ".xlsx"}:
-        return _bounded(read_office_segments(path)), {}, ""
+        return _bounded(read_office_segments(path, file_type=suffix)), {}, ""
     if suffix in {".txt", ".md", ".csv"}:
         text = _decode_text(path.read_bytes())
+        segments = []
         if suffix == ".csv":
             cells = 0
             for index, row in enumerate(csv.reader(io.StringIO(text)), 1):
@@ -162,33 +167,44 @@ def parse_attachment(path: Path, config, ocr_config: OCRConfigSnapshot, conversa
         else:
             segments = [{"location": f"第{index}行", "text": line} for index, line in enumerate(text.splitlines(), 1) if line.strip()]
         return _bounded(segments), {}, ""
-    if suffix == ".pdf":
-        from .pdf_text import PdfTextMissing
-        try:
+
+    invoice_result = parse_with_fallback(path, config, ocr_config=ocr_config, approval_id=None,
+        template_code="", parent_db=None, sha256=sha256, previous=previous, agent_conversation_id=conversation_id)
+    kind = invoice_result.get("material_type", "UNKNOWN")
+    warning = invoice_result.get("error") or ""
+    if kind == "UNKNOWN" or invoice_result.get("rejected"):
+        # 保留首页分类结果供用户核对；无正文不再触发全文模型，也不丢失分类失败依据。
+        return [], invoice_result, warning or "附件类别尚未确认，请核对原件"
+    if kind == "INVOICE":
+        raw = invoice_result.get("raw_text", "")
+        if suffix in {".xml", ".ofd"}:
+            if len(raw) >= 30000:
+                raise ValueError("结构化文件正文过长，请拆分后上传")
+            segments = [{"location": "结构化原件", "text": raw}] if raw.strip() else []
+        elif suffix == ".pdf" and raw.strip():
             segments = read_pdf_segments(path, max_text=MAX_TEXT)
-        except PdfTextMissing:
-            # 扫描 PDF 仍进入整份图像分类，正文缺失单独提示，不提前误报文件解析失败。
-            warning = "扫描 PDF 无本地文字层，请结合原件核对正文"
-        suspected = True
-    elif suffix in {".xml", ".ofd"}:
-        local = parse(path)
-        text = local.get("raw_text", "")
-        if len(text) >= 30000:
-            raise ValueError("结构化文件正文过长，请拆分后上传")
-        segments, suspected = [{"location": "结构化原件", "text": text}], True
-    else:
-        segments, suspected = _image_reading(path, config, conversation_id)
-        suspected = True
-    if suspected:
-        invoice_result = parse_with_fallback(path, config, ocr_config=ocr_config, approval_id=None, template_code="", parent_db=None,
-            sha256=sha256, previous=previous, local_result=local, agent_conversation_id=conversation_id)
-        if invoice_result.get("rejected"):
-            warning = invoice_result.get("error") or "原件含多张发票或身份存在冲突，无法判定使用状态"
-        elif invoice_result.get("material_type") == "UNKNOWN":
-            warning = invoice_result.get("error") or "附件类别尚未确认"
-        elif invoice_result.get("material_type") == "INVOICE" and not ((invoice_result.get("recognition") or {}).get("fields") or {}).get("number"):
-            warning = "发票号码尚未取得可信一致结果，使用状态无法判定；可上传清晰原件重试"
-    return _bounded(segments), invoice_result, warning
+        else:
+            # 扫描票已由 OCR／票面模型读取；只展示已提取字段，不能把字段表冒充完整正文。
+            fields = invoice_result.get("fields") or {}
+            content = "\n".join(f"{label}：{fields[field]}" for field, label in FIELD_LABELS.items() if fields.get(field))
+            segments = [{"location": "票面识别字段（非完整正文）", "text": content}] if content else []
+            warning = warning or "当前提供票面识别字段，完整正文请查看原件"
+        if not ((invoice_result.get("recognition") or {}).get("fields") or {}).get("number"):
+            warning = warning or "发票号码尚未可靠识别，使用状态无法判定"
+        return _bounded(segments) if segments else [], invoice_result, warning
+
+    # 普通材料的正文阅读发生在分类之后；首页类别已确定不等于正文已完整读取。
+    try:
+        if suffix == ".pdf":
+            try:
+                segments = read_pdf_segments(path, max_text=MAX_TEXT)
+            except PdfTextMissing:
+                segments = _image_reading(path, config, conversation_id, file_type=suffix, material_type=kind)
+        else:
+            segments = _image_reading(path, config, conversation_id, file_type=suffix, material_type=kind)
+        return _bounded(segments), invoice_result, ""
+    except ValueError as exc:
+        return [], invoice_result, str(exc)
 
 
 class AttachmentManager:

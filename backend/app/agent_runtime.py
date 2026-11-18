@@ -4,7 +4,7 @@ import logging
 import tempfile
 import threading
 from pathlib import Path
-from typing import Callable, Literal
+from typing import Callable, Literal, TypeVar
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -13,11 +13,13 @@ from .ai_logs import AICallRecorder
 from .errors import StaleSnapshotError
 from .model_config import EffectiveModelConfig, SYSTEM_CONSTRAINTS, effective_prompt
 from .audit_policy import enabled_custom_rules
+from .structured_output import ModelOutputError, parse_structured_output
 
 logger = logging.getLogger(__name__)
 INITIALIZE_SECONDS = 30
 AUDIT_SECONDS = 60
 MAX_OUTPUT_TOKENS = 4096
+ModelT = TypeVar("ModelT", bound=BaseModel)
 INVOICE_EXTRACTION_PROMPT = (
     "你是发票票面信息提取助手。直接阅读提供的原件图像，提取同一张发票的号码、代码、购买方名称、"
     "购买方税号、销售方名称、开票日期和价税合计（小写）。注意购买方与销售方不能混淆，"
@@ -80,10 +82,6 @@ class InvoiceExtractionResult(BaseModel):
     clear_fields: InvoiceFieldClarity = Field(description="每个票面字段能否从原图直接清晰辨认")
 
 
-class ModelOutputError(ValueError):
-    """程序生成、可公开的字段校验错误，禁止把供应商异常正文直接作为用户说明。"""
-
-
 class InvoiceMultiplicityError(ModelOutputError):
     """模型未识别到唯一发票；即使本地存在候选，也不能继续自动审批。"""
 
@@ -99,10 +97,15 @@ def _runtime_patch(config: EffectiveModelConfig) -> list[dict]:
                 "retryPolicy": {"mode": "normal", "maxRetries": 0}}}}}]}]
 
 
-def _run_structured_model(config: EffectiveModelConfig, prompt: str, payload: dict, validate: Callable[[str], dict], *,
-                          constraints: str, trace: AICallRecorder | None = None, images: list[dict] | None = None,
+def _run_structured_model(config: EffectiveModelConfig, prompt: str, payload: dict, validate: Callable[[ModelT], dict], *,
+                          output_model: type[ModelT], constraints: str,
+                          trace: AICallRecorder | None = None, images: list[dict] | None = None,
                           before_request: Callable[[], None] | None = None) -> dict:
-    """共用隔离、超时及日志机制；before_request 在模型请求发出前复核审批快照。"""
+    """共用隔离、超时、JSON 解析及日志机制。
+
+    output_model 定义字段结构；validate 接收唯一通过结构校验的模型实例，只做业务判断
+    和结果转换。before_request 在模型请求发出前复核审批快照。
+    """
     def finish(result, error_type=""):
         if trace:
             trace.finish(result, error_type=error_type)
@@ -181,10 +184,22 @@ def _run_structured_model(config: EffectiveModelConfig, prompt: str, payload: di
                 trace.set_output(result.final_response)
             if result.finish_reason != "completed":
                 raise ValueError("incomplete")
-            content = result.final_response.strip()
-            if content.startswith("```") and content.endswith("```"):
-                content = content.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-            return finish({"status": "COMPLETED", **validate(content)})
+            if trace:
+                trace.progress("解析模型结构化输出", kind="output/start")
+            try:
+                parsed = parse_structured_output(result.final_response, output_model)
+            except ModelOutputError:
+                if trace:
+                    trace.progress("结构化输出解析或字段校验未通过", kind="output/failed")
+                raise
+            if trace:
+                trace.progress("已解析完整 JSON 对象" if parsed.mode == "direct"
+                               else "已从模型回复中提取唯一有效 JSON 对象", kind="output/parsed")
+                repair_labels = {"bom": "已清理开头 BOM", "trailing_comma": "已移除字符串外的 JSON 尾逗号"}
+                for repair in parsed.repairs:
+                    trace.progress(repair_labels[repair], kind="output/repaired")
+                trace.progress("JSON 字段校验通过，开始业务校验", kind="output/validated")
+            return finish({"status": "COMPLETED", **validate(parsed.value)})
     except StaleSnapshotError as exc:
         finish({"status": "SKIPPED", "summary": str(exc)})
         raise
@@ -199,8 +214,7 @@ def _run_structured_model(config: EffectiveModelConfig, prompt: str, payload: di
 def run_model_analysis(config: EffectiveModelConfig, prompt: str, payload: dict, *, trace: AICallRecorder | None = None,
                        before_request: Callable[[], None] | None = None) -> dict:
     """语义审核仅接受风险说明；不把票面提取提示词或字段混入审批结论。"""
-    def validate(content):
-        analysis = SemanticResult.model_validate_json(content)
+    def validate(analysis: SemanticResult) -> dict:
         if not analysis.summary.strip():
             raise ValueError("empty summary")
         results = []
@@ -219,15 +233,15 @@ def run_model_analysis(config: EffectiveModelConfig, prompt: str, payload: dict,
         return {"risk_level": analysis.risk_level, "summary": analysis.summary.strip()[:2000],
                 "findings": [x[:500] for x in analysis.findings[:20]], "rule_results": results}
 
-    return _run_structured_model(config, prompt, payload, validate, constraints=SYSTEM_CONSTRAINTS, trace=trace,
+    return _run_structured_model(config, prompt, payload, validate,
+                                 output_model=SemanticResult, constraints=SYSTEM_CONSTRAINTS, trace=trace,
                                  before_request=before_request)
 
 
 def extract_invoice(config: EffectiveModelConfig, images: list[dict], *, trace: AICallRecorder,
                     before_request: Callable[[], None] | None = None) -> dict:
     """独立阅读原件，只返回分字段候选；禁止给模型传入文字/OCR 候选造成相互暗示。"""
-    def validate(content):
-        extracted = InvoiceExtractionResult.model_validate_json(content)
+    def validate(extracted: InvoiceExtractionResult) -> dict:
         if extracted.invoice_count != 1:
             raise InvoiceMultiplicityError("原件未识别到唯一发票；多张发票请拆分后重新提交")
         return {"summary": "已独立读取原件图像，等待逐字段交叉核对",
@@ -236,7 +250,8 @@ def extract_invoice(config: EffectiveModelConfig, images: list[dict], *, trace: 
 
     return _run_structured_model(config, INVOICE_EXTRACTION_PROMPT,
         {"image_count": len(images), "task": "独立阅读全部原件图像，逐位提取票面字段并标记是否清晰；不猜测模糊内容"},
-        validate, constraints=INVOICE_EXTRACTION_CONSTRAINTS, trace=trace, images=images, before_request=before_request)
+        validate, output_model=InvoiceExtractionResult, constraints=INVOICE_EXTRACTION_CONSTRAINTS,
+        trace=trace, images=images, before_request=before_request)
 
 
 def model_analyze(config: EffectiveModelConfig, template, approval, invoices: list[dict], *, trace: AICallRecorder,
