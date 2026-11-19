@@ -90,14 +90,19 @@ def fields_from_xml(data: bytes) -> tuple[dict, str]:
     return fields, "\n".join(f"{key}: {','.join(value)}" for key, value in values.items())
 
 
-def fields_from_text(text: str) -> dict:
+def fields_from_text(text: str, *, allow_unlabeled_number: bool = True) -> dict:
+    """提取票面文字字段。PDF 关闭无标签号码推断，由调用方补充坐标候选。"""
     text = unicodedata.normalize("NFKC", text)
     # OCR 可能把一个标签拆成多个文本框；只拼合已知标签，不拼接票号或猜测字符。
     for label in ("发票号码", "发票编号", "发票代码", "开票日期", "开票时间", "价税合计", "小写",
                   "购买方名称", "销售方名称", "购买方税号", "购方税号", "纳税人识别号", "统一社会信用代码"):
         text = re.sub(r"\s*".join(map(re.escape, label)), label, text)
-    if len(set(re.findall(r"(?<!\d)\d{20}(?!\d)", text))) > 1:
-        raise ParseRejected("同一附件包含多张数电发票，请拆分为独立原件后重新提交")
+    # OFD 兼容无标签的数电票号。PDF 备注中的银行账号也可能恰好是 20 位数字。
+    numeric_candidates = set()
+    if allow_unlabeled_number:
+        numeric_candidates = set(re.findall(r"(?<!\d)\d{20}(?!\d)", text))
+        if len(numeric_candidates) > 1:
+            raise ParseRejected("同一附件包含多张数电发票，请拆分为独立原件后重新提交")
     if len(set(re.findall(r"(?:发票号码|发票编号|Invoice\s*(?:Number|No))\s*[:：]?\s*([0-9]{20}|[0-9]{8})(?![0-9])", text, re.I))) > 1:
         raise ParseRejected("同一附件包含不同发票号码，请拆分为独立原件后重新提交")
     patterns = {
@@ -133,16 +138,14 @@ def fields_from_text(text: str) -> dict:
             match = re.search(rf"(?:^|\s){label}\s+名称\s*[:：]\s*([^\n]+)", text, re.M)
             if match:
                 fields[field] = re.split(r"\s{2,}", match.group(1).strip(), maxsplit=1)[0]
-    if not fields.get("number"):
-        numbers = set(re.findall(r"(?<!\d)\d{20}(?!\d)", text))
-        if len(numbers) == 1:
-            fields["number"] = numbers.pop()
+    if not fields.get("number") and len(numeric_candidates) == 1:
+        fields["number"] = numeric_candidates.pop()
     return fields
 
 
 def _pdf_text_source(path: Path, text: str) -> dict:
     """普通文字与坐标结果共同组成 TEXT；只有规范化后无歧义的候选可参与本地裁决。"""
-    fields = fields_from_text(text)
+    fields = fields_from_text(text, allow_unlabeled_number=False)
     error = ""
     try:
         positioned = read_pdf_invoice_fields(path)
